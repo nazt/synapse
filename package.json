@@ -1,0 +1,20 @@
+{
+  "name": "synapse",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Synapse — drag-connect graph board (Bun/Elysia + React19/Vite/Tailwind4 + @xyflow/react), a maw-serve plugin",
+  "scripts": {
+    "dev": "bun run scripts/dev.ts",
+    "dev:server": "cd server && bun run dev",
+    "dev:web": "cd web && bun run dev",
+    "build": "cd web && bun run build",
+    "start": "cd server && bun run start",
+    "typecheck": "tsc --noEmit && cd server && bun run typecheck && cd ../web && bun run typecheck",
+    "install:all": "bun install && cd server && bun install && cd ../web && bun install"
+  },
+  "workspaces": ["server", "web"],
+  "devDependencies": {
+    "bun-types": "^1.3.14"
+  }
+}

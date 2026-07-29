@@ -1,0 +1,15 @@
+{
+  "name": "synapse",
+  "version": "0.1.0",
+  "description": "Synapse — drag-connect graph board, extending maw serve",
+  "sdk": "^1.0.0",
+  "cli": { "command": "synapse", "aliases": ["graph"] },
+  "engine": {
+    "serve": {
+      "prefix": "/api/synapse",
+      "health": "/api/synapse/health",
+      "command": "bun run server/index.ts"
+    }
+  },
+  "capabilities": ["peer"]
+}
