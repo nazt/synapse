@@ -1,1 +1,101 @@
 @import "tailwindcss";
+
+@theme {
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Fira Code", Menlo,
+    monospace;
+}
+
+:root {
+  color-scheme: dark;
+}
+
+/* ── HUD ambience ─────────────────────────────────────────────────────── */
+
+/* Deep-space ground: radial core glow + faint scan grid behind the canvas. */
+.hud-space {
+  background-color: #06070c;
+  background-image:
+    radial-gradient(
+      ellipse 80% 60% at 50% 42%,
+      rgba(56, 116, 190, 0.16),
+      transparent 70%
+    ),
+    radial-gradient(
+      ellipse 50% 50% at 85% 90%,
+      rgba(120, 90, 200, 0.08),
+      transparent 70%
+    );
+}
+
+/* Live status pulse ring. */
+@keyframes hud-ping {
+  0% {
+    transform: scale(0.8);
+    opacity: 0.7;
+  }
+  70% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+.hud-ping {
+  animation: hud-ping 2.4s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+/* Slow border sheen for live tiles. */
+@keyframes hud-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+.hud-breathe {
+  animation: hud-breathe 3.2s ease-in-out infinite;
+}
+
+/* Node entrance. */
+@keyframes hud-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Neon flow along connected edges. */
+.react-flow__edge.is-team .react-flow__edge-path {
+  stroke-dasharray: 6 6;
+  animation: hud-flow 0.6s linear infinite;
+}
+@keyframes hud-flow {
+  to {
+    stroke-dashoffset: -12;
+  }
+}
+
+/* Corner brackets. */
+.hud-corner {
+  position: absolute;
+  width: 10px;
+  height: 10px;
+  border-color: currentColor;
+  opacity: 0.55;
+  transition: opacity 0.2s ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .hud-ping,
+  .hud-breathe,
+  .react-flow__edge.is-team .react-flow__edge-path {
+    animation: none !important;
+  }
+}

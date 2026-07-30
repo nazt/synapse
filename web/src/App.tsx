@@ -189,14 +189,15 @@ export default function App() {
         const inTeam = highlightSet.has(e.source) && highlightSet.has(e.target);
         return {
           ...e,
-          animated: inTeam,
+          className: inTeam ? "is-team" : undefined,
+          animated: false,
           style: inTeam
             ? {
-                stroke: "#64b5f6",
-                strokeWidth: 2.5,
-                filter: "drop-shadow(0 0 5px rgba(100,181,246,0.65))",
+                stroke: "#64d3ff",
+                strokeWidth: 2,
+                filter: "drop-shadow(0 0 6px rgba(100,211,255,0.8))",
               }
-            : { stroke: "#3b3b49", strokeWidth: 1.5 },
+            : { stroke: "#2b3546", strokeWidth: 1.5 },
         };
       }),
     [edges, highlightSet],
@@ -295,22 +296,26 @@ export default function App() {
   }, [nodes, armedId, dryRun, target.length, edges.length, submit, armOrLink, setEdges]);
 
   return (
-    <div className="relative h-screen w-screen" style={{ background: "#0a0a0f" }}>
+    <div className="hud-space relative h-screen w-screen">
       {/* Header */}
       <header className="pointer-events-none absolute left-0 top-0 z-10 flex items-center gap-3 px-5 py-4">
         <div className="flex items-baseline gap-2.5">
           <h1
-            className="text-[17px] font-semibold tracking-tight"
-            style={{ color: "#64b5f6" }}
+            className="text-[17px] font-bold tracking-[0.18em]"
+            style={{
+              color: "#8fd0ff",
+              textShadow: "0 0 18px rgba(100,181,246,0.55)",
+            }}
           >
-            Synapse
+            SYNAPSE
           </h1>
-          <span className="text-[11px] tabular-nums text-neutral-600">
-            {liveCount}/{nodes.length} live
+          <span className="font-mono text-[11px] tabular-nums text-neutral-500">
+            <span style={{ color: "#34e5b0" }}>{liveCount}</span>/{nodes.length}{" "}
+            live
           </span>
         </div>
-        <span className="hidden text-xs text-neutral-500 sm:inline">
-          click an oracle, then another, to link them into a team
+        <span className="hidden font-mono text-[11px] uppercase tracking-wide text-neutral-600 sm:inline">
+          tap an oracle · then another · to link a team
         </span>
         {mock && (
           <span className="rounded-md bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-400">
@@ -343,14 +348,23 @@ export default function App() {
         proOptions={{ hideAttribution: true }}
         colorMode="dark"
       >
-        <Background color="#191922" gap={26} size={1.5} />
+        <Background color="#1a2740" gap={30} size={1} />
         <Controls showInteractive={false} />
         <MiniMap
           pannable
           zoomable
-          nodeColor="#64b5f6"
-          maskColor="rgba(10,10,15,0.7)"
-          style={{ background: "#12121a" }}
+          nodeColor={(n) =>
+            (n.data as { status?: string })?.status === "active"
+              ? "#34e5b0"
+              : (n.data as { status?: string })?.status === "idle"
+                ? "#fbbf24"
+                : "#3a4761"
+          }
+          maskColor="rgba(6,7,12,0.78)"
+          style={{
+            background: "rgba(12,16,24,0.6)",
+            border: "1px solid rgba(100,181,246,0.12)",
+          }}
         />
       </ReactFlow>
 
@@ -358,15 +372,17 @@ export default function App() {
       {armedId && (
         <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2">
           <div
-            className="rounded-full border px-4 py-1.5 text-xs font-medium shadow-lg"
+            className="rounded-full border px-4 py-1.5 font-mono text-[11px] uppercase tracking-wide shadow-lg"
             style={{
-              background: "#171f2b",
-              borderColor: "#eab308",
-              color: "#eab308",
+              background: "rgba(23,20,10,0.75)",
+              backdropFilter: "blur(8px)",
+              borderColor: "rgba(245,158,11,0.55)",
+              color: "#fbbf24",
+              boxShadow: "0 0 24px rgba(245,158,11,0.25)",
             }}
           >
-            🔗 linking from <b>{armedId}</b> — click another oracle · Esc to
-            cancel
+            ▸ linking from <b className="font-semibold">{armedId}</b> · tap
+            another · esc to cancel
           </div>
         </div>
       )}
@@ -375,7 +391,14 @@ export default function App() {
       <div className="absolute bottom-4 right-4 z-10 w-80 max-w-[calc(100vw-2rem)]">
         <div
           className="rounded-xl border p-4 shadow-2xl"
-          style={{ background: "#12121a", borderColor: "#2a2a35" }}
+          style={{
+            background: "rgba(12,16,24,0.72)",
+            backdropFilter: "blur(12px)",
+            WebkitBackdropFilter: "blur(12px)",
+            borderColor: "rgba(100,181,246,0.16)",
+            boxShadow:
+              "0 12px 40px rgba(0,0,0,0.55), inset 0 1px 0 rgba(255,255,255,0.04)",
+          }}
         >
           <div className="flex items-center justify-between">
             <span className="text-sm font-semibold text-neutral-100">
@@ -489,13 +512,20 @@ export default function App() {
       <button
         type="button"
         onClick={() => setPaletteOpen(true)}
-        className="absolute bottom-4 left-4 z-10 flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium text-neutral-400 transition-colors hover:text-neutral-200"
-        style={{ background: "#12121a", borderColor: "#2a2a35" }}
+        className="absolute bottom-4 left-4 z-10 flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 font-mono text-[11px] uppercase tracking-wide text-neutral-400 transition-colors hover:text-neutral-100"
+        style={{
+          background: "rgba(12,16,24,0.72)",
+          backdropFilter: "blur(10px)",
+          borderColor: "rgba(100,181,246,0.16)",
+        }}
       >
-        <kbd className="rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] text-neutral-300">
+        <kbd
+          className="rounded px-1.5 py-0.5 text-[10px] text-neutral-200"
+          style={{ background: "rgba(100,181,246,0.14)" }}
+        >
           ⌘K
         </kbd>
-        search & link
+        search &amp; link
       </button>
 
       <CommandPalette
