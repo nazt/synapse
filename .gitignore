@@ -21,3 +21,6 @@ dist/
 
 # Temp
 .tmp/
+
+# maw synapse detached run state
+.synapse/

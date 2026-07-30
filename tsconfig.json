@@ -15,5 +15,5 @@
     "noFallthroughCasesInSwitch": true,
     "types": ["bun-types"]
   },
-  "include": ["scripts"]
+  "include": ["scripts", "cli.ts"]
 }

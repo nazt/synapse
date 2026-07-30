@@ -3,7 +3,12 @@
   "version": "0.1.0",
   "description": "Synapse — drag-connect graph board, extending maw serve",
   "sdk": "^1.0.0",
-  "cli": { "command": "synapse", "aliases": ["graph"] },
+  "entry": "./cli.ts",
+  "cli": {
+    "command": "synapse",
+    "aliases": ["graph"],
+    "help": "maw synapse <serve|dev|build|status>"
+  },
   "engine": {
     "serve": {
       "prefix": "/api/synapse",
