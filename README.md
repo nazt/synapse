@@ -6,8 +6,24 @@ Synapse is a two-package monorepo that mounts under `maw serve`. A Bun/Elysia
 server exposes a health endpoint and serves the built React SPA; a Vite +
 React 19 + Tailwind v4 web app provides the board UI.
 
-**Status:** Commit 1 — runnable scaffold only. `bun run dev` boots cleanly, a
-blank page renders, and `/health` returns `ok`. No drag-connect graph yet.
+**Status:** #158 — drag-connect graph board. Nodes come from `maw census`
+(each an `OracleNode` tile with a status orb + host); drag from one node's
+handle to another (`@xyflow/react`) to draw an edge. Union-find over the drawn
+edges groups nodes into teams; **Form Team** fans an invite-tone message out to
+each member via `maw hey <member> -f <file>` (a dry-run toggle, default ON,
+previews without sending).
+
+## API
+
+| Route | Purpose |
+| ----- | ------- |
+| `GET /api/synapse/census` | Shells `maw census --json`, flattens oracles → nodes. Falls back to a small mock if census is empty/unavailable. |
+| `POST /api/synapse/team` | Body `{ members: string[], dryRun?: boolean }`. Writes an invite message to a temp file and delivers it to each member with `maw hey <member> -f <file>`. `dryRun` (body flag or `?dryRun=true`) returns the planned `{ member, command, message }` list without sending. Returns `{ ok, sent, dryRun }`. |
+
+Two scars are designed around: `maw hey` rejects a body starting with `[` (it
+auto-signs a federation tag), and it mangles backtick / `$` / double-quote in an
+inline body — so the message is always written to a temp file and passed with
+`-f` (bytes-through, no shell).
 
 ## Stack
 
