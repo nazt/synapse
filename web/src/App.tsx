@@ -15,8 +15,17 @@ import {
 import "@xyflow/react/dist/style.css";
 
 import OracleNode from "./OracleNode";
+import CommandPalette, { type PaletteItem } from "./CommandPalette";
 import { buildUnionFind } from "./graph";
 import type { CensusResponse, OracleNodeType, TeamResponse } from "./types";
+
+const STATUS_DOT: Record<string, string> = {
+  active: "#34d399",
+  idle: "#fbbf24",
+};
+function dotFor(status: string): string {
+  return STATUS_DOT[status] ?? "#8595a8";
+}
 
 const nodeTypes: NodeTypes = { oracle: OracleNode };
 
@@ -66,6 +75,7 @@ export default function App() {
   const [result, setResult] = useState<TeamResponse | null>(null);
   const [mock, setMock] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   // Load census → nodes.
   useEffect(() => {
@@ -98,16 +108,16 @@ export default function App() {
     [setEdges],
   );
 
-  // Click-to-connect (the easy path — no precise handle-dragging):
-  // tap oracle A → it arms (amber); tap oracle B → edge A→B; tap A again → cancel.
-  const onNodeClick: NodeMouseHandler<OracleNodeType> = useCallback(
-    (_event, node) => {
+  // Arm-or-link: the shared core of click-to-connect and the ⌘K palette.
+  // First pick arms A (amber); second pick links A→B; picking A again cancels.
+  const armOrLink = useCallback(
+    (id: string) => {
       setArmedId((cur) => {
-        if (cur === null) return node.id; // arm A
-        if (cur === node.id) return null; // tapped self → cancel
+        if (cur === null) return id; // arm A
+        if (cur === id) return null; // picked self → cancel
         const conn: Connection = {
           source: cur,
-          target: node.id,
+          target: id,
           sourceHandle: null,
           targetHandle: null,
         };
@@ -116,6 +126,11 @@ export default function App() {
       });
     },
     [setEdges],
+  );
+
+  const onNodeClick: NodeMouseHandler<OracleNodeType> = useCallback(
+    (_event, node) => armOrLink(node.id),
+    [armOrLink],
   );
 
   // Click empty canvas → cancel a pending link.
@@ -220,6 +235,11 @@ export default function App() {
   // Cmd/Ctrl+Enter to form the team.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+        return;
+      }
       if (e.key === "Escape") setArmedId(null);
       if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
         e.preventDefault();
@@ -229,6 +249,50 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [submit]);
+
+  // ⌘K palette items: actions first, then every oracle (arm/link by keyboard).
+  const paletteItems = useMemo<PaletteItem[]>(() => {
+    const actions: PaletteItem[] = [
+      {
+        id: "action:form",
+        label: dryRun ? "Preview team" : "Form team",
+        section: "Actions",
+        hint: target.length >= 2 ? `⌘↵ · ${target.length}` : "need a team",
+        disabled: target.length < 2,
+        run: () => {
+          void submit();
+        },
+      },
+      {
+        id: "action:dryrun",
+        label: dryRun ? "Turn dry-run OFF (send for real)" : "Turn dry-run ON",
+        section: "Actions",
+        hint: dryRun ? "on" : "off",
+        run: () => setDryRun((d) => !d),
+      },
+      {
+        id: "action:clear",
+        label: "Clear all links",
+        section: "Actions",
+        hint: `${edges.length}`,
+        disabled: edges.length === 0,
+        run: () => setEdges([]),
+      },
+    ];
+    const oracleItems: PaletteItem[] = nodes.map((n) => ({
+      id: `oracle:${n.id}`,
+      label: n.id,
+      section: "Oracles",
+      hint: armedId === n.id ? "armed" : n.data.status,
+      dotColor: dotFor(n.data.status),
+      run: () => {
+        const willArm = armedId === null;
+        armOrLink(n.id);
+        return willArm; // keep palette open after arming, so you can pick B
+      },
+    }));
+    return [...actions, ...oracleItems];
+  }, [nodes, armedId, dryRun, target.length, edges.length, submit, armOrLink, setEdges]);
 
   return (
     <div className="relative h-screen w-screen" style={{ background: "#0a0a0f" }}>
@@ -420,6 +484,25 @@ export default function App() {
           )}
         </div>
       </div>
+
+      {/* ⌘K affordance */}
+      <button
+        type="button"
+        onClick={() => setPaletteOpen(true)}
+        className="absolute bottom-4 left-4 z-10 flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium text-neutral-400 transition-colors hover:text-neutral-200"
+        style={{ background: "#12121a", borderColor: "#2a2a35" }}
+      >
+        <kbd className="rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] text-neutral-300">
+          ⌘K
+        </kbd>
+        search & link
+      </button>
+
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        items={paletteItems}
+      />
     </div>
   );
 }
