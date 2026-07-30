@@ -7,6 +7,8 @@ export type OracleCensus = {
   status: string;
   host: string;
   session: string;
+  // Precise tmux pane handle (e.g. "%3855") — best `maw peek` target; may be "".
+  pane: string;
   idleSec: number;
 };
 

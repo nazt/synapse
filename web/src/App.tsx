@@ -17,6 +17,7 @@ import "@xyflow/react/dist/style.css";
 import OracleNode from "./OracleNode";
 import SpaceField, { type VP } from "./SpaceField";
 import CommandPalette, { type PaletteItem } from "./CommandPalette";
+import TerminalInspector from "./TerminalInspector";
 import {
   membersByTeam,
   teamsForNode,
@@ -25,6 +26,7 @@ import {
 } from "./graph";
 import type {
   CensusResponse,
+  OracleCensus,
   OracleNodeType,
   TeamEdge,
   TeamResponse,
@@ -81,6 +83,9 @@ export default function App() {
   const [editingId, setEditingId] = useState<string | null>(null);
 
   const [armedId, setArmedId] = useState<string | null>(null);
+  // The oracle whose live terminal is open in the inspector dock (right-click a
+  // node, ⌘K → Inspect, or click a team member chip).
+  const [inspectId, setInspectId] = useState<string | null>(null);
   const [dryRun, setDryRun] = useState(true);
   const [busyTeam, setBusyTeam] = useState<string | null>(null);
   const [results, setResults] = useState<Record<string, TeamResponse>>({});
@@ -132,10 +137,27 @@ export default function App() {
     [],
   );
 
+  // Deep-link: ?inspect=<oracle> auto-opens that oracle's terminal on load — a
+  // shareable link straight to a fleet member's live pane.
+  useEffect(() => {
+    const q = new URLSearchParams(window.location.search).get("inspect");
+    if (q) setInspectId(q);
+  }, []);
+
   const active = useMemo(
     () => teams.find((t) => t.id === activeTeamId) ?? null,
     [teams, activeTeamId],
   );
+
+  // The census row backing the terminal inspector (node.data carries all the
+  // census fields). Falls to null when the node is gone or nothing is focused.
+  const inspectOracle = useMemo<OracleCensus | null>(() => {
+    if (!inspectId) return null;
+    const n = nodes.find((x) => x.id === inspectId);
+    if (!n) return null;
+    const { name, status, host, session, pane, idleSec } = n.data;
+    return { name, status, host, session, pane, idleSec };
+  }, [inspectId, nodes]);
 
   // ── Team actions ───────────────────────────────────────────────────────
   const addTeam = useCallback(() => {
@@ -222,6 +244,28 @@ export default function App() {
     [armOrLink],
   );
   const onPaneClick = useCallback(() => setArmedId(null), []);
+
+  // Right-click a node → open its live terminal in the inspector. preventDefault
+  // suppresses the browser context menu; click-to-connect stays on left-click.
+  const onNodeContextMenu: NodeMouseHandler<OracleNodeType> = useCallback(
+    (e, node) => {
+      e.preventDefault();
+      setInspectId(node.id);
+    },
+    [],
+  );
+
+  // Add one oracle to the ACTIVE team. Membership is edge-derived, so link it to
+  // an existing member; if the team is empty, arm it as the team's first pick.
+  const addToActiveTeam = useCallback(
+    (name: string) => {
+      const members = [...(membersByTeam(edges).get(activeTeamId) ?? [])];
+      const anchor = members.find((m) => m !== name);
+      if (anchor) link(name, anchor, activeTeamId);
+      else setArmedId(name);
+    },
+    [edges, activeTeamId, link],
+  );
 
   const onMove = useCallback((_e: unknown, vp: Viewport) => {
     viewportRef.current = vp;
@@ -440,7 +484,15 @@ export default function App() {
         return willArm; // keep palette open after arming, so you can pick B
       },
     }));
-    return [...actions, ...teamItems, ...oracleItems];
+    const inspectItems: PaletteItem[] = nodes.map((n) => ({
+      id: `inspect:${n.id}`,
+      label: `⎙ ${n.id} terminal`,
+      section: "Inspect",
+      hint: "peek",
+      dotColor: dotFor(n.data.status),
+      run: () => setInspectId(n.id),
+    }));
+    return [...actions, ...teamItems, ...oracleItems, ...inspectItems];
   }, [
     nodes,
     teams,
@@ -476,7 +528,7 @@ export default function App() {
           </span>
         </div>
         <span className="hidden font-mono text-[11px] uppercase tracking-wide text-neutral-600 sm:inline">
-          tap oracles to link a team · click a team to stage it
+          tap to link · right-click for live terminal · click a team to stage
         </span>
         {mock && (
           <span className="rounded-md bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-400">
@@ -500,6 +552,7 @@ export default function App() {
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onNodeClick={onNodeClick}
+        onNodeContextMenu={onNodeContextMenu}
         onPaneClick={onPaneClick}
         onMove={onMove}
         onInit={(i) => {
@@ -677,16 +730,22 @@ export default function App() {
                   {members.length > 0 ? (
                     <div className="mt-2 flex flex-wrap gap-1">
                       {members.map((m) => (
-                        <span
+                        <button
+                          type="button"
                           key={m}
-                          className="rounded-full px-1.5 py-0.5 text-[11px]"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setInspectId(m);
+                          }}
+                          className="rounded-full px-1.5 py-0.5 text-[11px] transition-transform hover:scale-105"
                           style={{
                             background: `${t.color}1f`,
                             color: t.color,
                           }}
+                          title={`inspect ${m}`}
                         >
                           {m}
-                        </span>
+                        </button>
                       ))}
                     </div>
                   ) : (
@@ -765,6 +824,15 @@ export default function App() {
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}
         items={paletteItems}
+      />
+
+      {/* Terminal inspector — live read-only pane + Wake + add-to-team */}
+      <TerminalInspector
+        oracle={inspectOracle}
+        dryRun={dryRun}
+        activeTeamName={active?.name}
+        onAddToTeam={addToActiveTeam}
+        onClose={() => setInspectId(null)}
       />
     </div>
   );

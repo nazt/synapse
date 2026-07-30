@@ -188,12 +188,16 @@ type OracleNodeData = {
   status: string;
   host: string;
   session: string;
+  // Precise tmux pane handle (e.g. "%3855") — the best `maw peek` target when
+  // present; falls back to `session` (e.g. "01-agora") otherwise.
+  pane: string;
   idleSec: number;
 };
 
 type RawOracle = {
   oracle?: unknown;
   session?: unknown;
+  pane?: unknown;
   status?: unknown;
   idleSec?: unknown;
   annotation?: unknown;
@@ -201,11 +205,11 @@ type RawOracle = {
 
 // A tiny mock so the UI still renders when census is unavailable/empty.
 const CENSUS_MOCK: OracleNodeData[] = [
-  { name: "neo", status: "active", host: "fleet: neo", session: "mock", idleSec: 0 },
-  { name: "digger", status: "active", host: "fleet: digger", session: "mock", idleSec: 0 },
-  { name: "maw-rs", status: "idle", host: "fleet: maw-rs", session: "mock", idleSec: 42 },
-  { name: "noah", status: "stale", host: "fleet: noah", session: "mock", idleSec: 45000 },
-  { name: "pulse", status: "stale", host: "fleet: pulse", session: "mock", idleSec: 84000 },
+  { name: "neo", status: "active", host: "fleet: neo", session: "mock", pane: "", idleSec: 0 },
+  { name: "digger", status: "active", host: "fleet: digger", session: "mock", pane: "", idleSec: 0 },
+  { name: "maw-rs", status: "idle", host: "fleet: maw-rs", session: "mock", pane: "", idleSec: 42 },
+  { name: "noah", status: "stale", host: "fleet: noah", session: "mock", pane: "", idleSec: 45000 },
+  { name: "pulse", status: "stale", host: "fleet: pulse", session: "mock", pane: "", idleSec: 84000 },
 ];
 
 function flattenCensus(raw: unknown): OracleNodeData[] {
@@ -228,6 +232,7 @@ function flattenCensus(raw: unknown): OracleNodeData[] {
           status: typeof o.status === "string" ? o.status : "unknown",
           host: typeof o.annotation === "string" ? o.annotation : "",
           session: typeof o.session === "string" ? o.session : "",
+          pane: typeof o.pane === "string" ? o.pane : "",
           idleSec: typeof o.idleSec === "number" ? o.idleSec : -1,
         });
       }
@@ -339,6 +344,84 @@ async function fanOutTeam(
     }
   }
   return results;
+}
+
+// --- Terminal preview + lifecycle (peek / wake) -------------------------
+// TRUST BOUNDARY (matches the board family's convention — Stoa is read-only,
+// squad-board is loopback-only): `peek` is a READ-ONLY pane snapshot via
+// `maw peek` (never a writable shell); `wake` is DRY-RUN by default and only
+// spawns a session on an explicit opt-out. Both bind to whatever host the
+// server listens on — keep that loopback for a single machine.
+
+// tmux targets and oracle handles: session names ("01-agora"), pane ids
+// ("%3855"), and oracle names ("agora"). Allow only their character set —
+// blocks shell metacharacters and path traversal. (Args are passed to
+// Bun.spawn as an ARRAY, so there is no shell to escape into anyway; this is
+// defense-in-depth + a clean 400 for junk input.)
+function sanitizeTarget(v: string | undefined): string | null {
+  const s = (v ?? "").trim();
+  return s && /^[A-Za-z0-9._:%@-]{1,64}$/.test(s) ? s : null;
+}
+
+// Read-only terminal snapshot of a pane/session. `--history` includes the
+// scrollback so the preview shows real recent context, not just the viewport.
+async function runMawPeek(target: string, lines: number): Promise<{
+  ok: boolean;
+  output: string;
+  error?: string;
+}> {
+  try {
+    const proc = Bun.spawn(
+      ["maw", "peek", target, "--lines", String(lines), "--history"],
+      { stdout: "pipe", stderr: "pipe" },
+    );
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    if (proc.exitCode !== 0) {
+      return { ok: false, output: "", error: stderr.trim() || `exit ${proc.exitCode}` };
+    }
+    return { ok: true, output: stdout };
+  } catch (err) {
+    return { ok: false, output: "", error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+// Spawn/resume an oracle session. `--no-attach -y` so the server never tries to
+// take over a terminal and never blocks on a prompt. DRY-RUN by default: the
+// planned command is returned without running until an explicit opt-out.
+async function runMawWake(target: string, dryRun: boolean): Promise<{
+  ok: boolean;
+  command: string;
+  output: string;
+  dryRun: boolean;
+  error?: string;
+}> {
+  const argv = ["maw", "wake", target, "--no-attach", "-y"];
+  const command = argv.join(" ");
+  if (dryRun) {
+    return { ok: true, command: `# dry-run (not spawned): ${command}`, output: "", dryRun: true };
+  }
+  try {
+    const proc = Bun.spawn(argv, { stdout: "pipe", stderr: "pipe" });
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    const ok = proc.exitCode === 0;
+    return {
+      ok,
+      command,
+      output: (stdout + stderr).trim(),
+      dryRun: false,
+      ...(ok ? {} : { error: stderr.trim() || `exit ${proc.exitCode}` }),
+    };
+  } catch (err) {
+    return { ok: false, command, output: "", dryRun: false, error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 const app = new Elysia()
@@ -479,6 +562,51 @@ const app = new Elysia()
       query: t.Object({
         dryRun: t.Optional(t.String()),
       }),
+    },
+  )
+  // Read-only terminal preview. GET /api/synapse/peek?target=<pane|session>&lines=N
+  // → { ok, target, output } where output is the raw pane snapshot (ANSI intact,
+  // rendered by xterm client-side). READ-ONLY by construction — `maw peek` can
+  // only capture, never type.
+  .get(
+    "/api/synapse/peek",
+    async ({ query, set }) => {
+      const target = sanitizeTarget(query.target);
+      if (!target) {
+        set.status = 400;
+        return { ok: false, error: "invalid target (expected [A-Za-z0-9._:%@-])" };
+      }
+      const n = Number.parseInt(query.lines ?? "", 10);
+      const lines = Number.isFinite(n) ? Math.min(Math.max(n, 1), 400) : 60;
+      const res = await runMawPeek(target, lines);
+      if (!res.ok) {
+        set.status = 502;
+        return { ok: false, target, error: res.error };
+      }
+      return { ok: true, target, lines, output: res.output };
+    },
+    { query: t.Object({ target: t.Optional(t.String()), lines: t.Optional(t.String()) }) },
+  )
+  // Wake/spawn an oracle session. Body { target, dryRun? }. FAIL-SAFE: DEFAULTS
+  // to dryRun=true (like /team) — the planned command is returned without
+  // running until an explicit body `dryRun:false` (or ?dryRun=false/0). A live
+  // wake spawns a real tmux session on this host, so the opt-out is deliberate.
+  .post(
+    "/api/synapse/wake",
+    async ({ body, query, set }) => {
+      const target = sanitizeTarget(body.target);
+      if (!target) {
+        set.status = 400;
+        return { ok: false, error: "invalid target (expected [A-Za-z0-9._:%@-])", dryRun: true };
+      }
+      const dryRun =
+        body.dryRun ?? !(query.dryRun === "false" || query.dryRun === "0");
+      const res = await runMawWake(target, dryRun);
+      return res;
+    },
+    {
+      body: t.Object({ target: t.String(), dryRun: t.Optional(t.Boolean()) }),
+      query: t.Object({ dryRun: t.Optional(t.String()) }),
     },
   )
   // Serve the built SPA. Static assets resolve to real files; everything
