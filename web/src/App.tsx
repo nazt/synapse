@@ -1,23 +1,34 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow,
   Background,
+  BackgroundVariant,
   Controls,
   MiniMap,
-  addEdge,
   useNodesState,
   useEdgesState,
   type Connection,
-  type Edge,
   type NodeMouseHandler,
   type NodeTypes,
+  type Viewport,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
 import OracleNode from "./OracleNode";
+import SpaceField, { type VP } from "./SpaceField";
 import CommandPalette, { type PaletteItem } from "./CommandPalette";
-import { buildUnionFind } from "./graph";
-import type { CensusResponse, OracleNodeType, TeamResponse } from "./types";
+import {
+  membersByTeam,
+  teamsForNode,
+  newTeam,
+  type Team,
+} from "./graph";
+import type {
+  CensusResponse,
+  OracleNodeType,
+  TeamEdge,
+  TeamResponse,
+} from "./types";
 
 const STATUS_DOT: Record<string, string> = {
   active: "#34d399",
@@ -29,33 +40,20 @@ function dotFor(status: string): string {
 
 const nodeTypes: NodeTypes = { oracle: OracleNode };
 
-const defaultEdgeOptions = {
-  animated: true,
-  style: { stroke: "#64b5f6", strokeWidth: 2 },
-} as const;
-
-// Calm status-grouped grid: dense, scannable, short edges. Active oracles land
-// first (top-left), so the live fleet reads at a glance. Columns scale gently
-// with fleet size and cap at 5 so rows stay readable, not a mile wide.
-const COL_STEP = 248;
-const ROW_STEP = 132;
-function gridColumns(count: number): number {
-  return Math.min(5, Math.max(3, Math.ceil(Math.sqrt(count))));
-}
-function layout(count: number, i: number): { x: number; y: number } {
-  const cols = gridColumns(count);
-  const rows = Math.ceil(count / cols);
-  const col = i % cols;
-  const row = Math.floor(i / cols);
-  // Center the grid on the origin so fitView frames it evenly.
-  return {
-    x: (col - (cols - 1) / 2) * COL_STEP,
-    y: (row - (rows - 1) / 2) * ROW_STEP,
-  };
+// ── Organic layout ──────────────────────────────────────────────────────
+// Golden-angle phyllotaxis scatter: deterministic (stable across census
+// refreshes), even areal density, and NO rows/columns — the rigid grid is
+// gone. Continuous drift is a pure CSS transform inside OracleNode, so node
+// positions here stay fixed and never fight drag / click-to-connect.
+const GOLDEN = Math.PI * (3 - Math.sqrt(5)); // 2.39996… rad
+function layout(i: number): { x: number; y: number } {
+  const r = 172 * Math.sqrt(i + 0.5);
+  const a = i * GOLDEN;
+  return { x: Math.cos(a) * r, y: Math.sin(a) * r };
 }
 
-// Show the useful oracles first: active → idle → everything else. Stable
-// tiebreak by name so the grid doesn't reshuffle between census refreshes.
+// Show useful oracles first: active → idle → everything else. Stable tiebreak
+// by name so the scatter doesn't reshuffle between census refreshes.
 const STATUS_RANK: Record<string, number> = { active: 0, idle: 1 };
 function byStatus(
   a: { status: string; name: string },
@@ -65,19 +63,38 @@ function byStatus(
   return d !== 0 ? d : a.name.localeCompare(b.name);
 }
 
+// Build a deduped, team-tagged edge id — includes teamId so the SAME A–B pair
+// can live in two teams, and dedupes within one team (either direction).
+function edgeId(teamId: string, a: string, b: string): string {
+  return `${teamId}:${a}-${b}`;
+}
+
 export default function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState<OracleNodeType>([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
-  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<TeamEdge>([]);
+
+  // One default team so the board works immediately — activeTeamId is a string.
+  const initialTeam = useMemo(() => newTeam(0), []);
+  const [teams, setTeams] = useState<Team[]>([initialTeam]);
+  const [activeTeamId, setActiveTeamId] = useState<string>(initialTeam.id);
+  const [hoverTeamId, setHoverTeamId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+
   const [armedId, setArmedId] = useState<string | null>(null);
   const [dryRun, setDryRun] = useState(true);
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<TeamResponse | null>(null);
+  const [busyTeam, setBusyTeam] = useState<string | null>(null);
+  const [results, setResults] = useState<Record<string, TeamResponse>>({});
+  const [recentEdge, setRecentEdge] = useState<string | null>(null);
   const [mock, setMock] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
 
-  // Load census → nodes.
+  // Live viewport for the parallax starfield — written on every pan/zoom via a
+  // ref (NOT React state, which would thrash the tree every frame).
+  const viewportRef = useRef<VP>({ x: 0, y: 0, zoom: 1 });
+  const flashTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Load census → nodes (organic scatter).
   useEffect(() => {
     let cancelled = false;
     fetch("/api/synapse/census")
@@ -90,8 +107,13 @@ export default function App() {
           sorted.map((o, i) => ({
             id: o.name,
             type: "oracle" as const,
-            position: layout(sorted.length, i),
-            data: { ...o, highlighted: false, armed: false },
+            position: layout(i),
+            data: {
+              ...o,
+              armed: false,
+              stage: "neutral" as const,
+              teamColors: [],
+            },
           })),
         );
       })
@@ -103,137 +125,240 @@ export default function App() {
     };
   }, [setNodes]);
 
-  const onConnect = useCallback(
-    (connection: Connection) => setEdges((eds) => addEdge(connection, eds)),
-    [setEdges],
+  useEffect(
+    () => () => {
+      if (flashTimer.current) clearTimeout(flashTimer.current);
+    },
+    [],
   );
 
-  // Arm-or-link: the shared core of click-to-connect and the ⌘K palette.
-  // First pick arms A (amber); second pick links A→B; picking A again cancels.
-  const armOrLink = useCallback(
+  const active = useMemo(
+    () => teams.find((t) => t.id === activeTeamId) ?? null,
+    [teams, activeTeamId],
+  );
+
+  // ── Team actions ───────────────────────────────────────────────────────
+  const addTeam = useCallback(() => {
+    setTeams((ts) => {
+      const t = newTeam(ts.length);
+      setActiveTeamId(t.id);
+      setEditingId(t.id);
+      return [...ts, t];
+    });
+  }, []);
+
+  const renameTeam = useCallback((id: string, name: string) => {
+    setTeams((ts) => ts.map((t) => (t.id === id ? { ...t, name } : t)));
+  }, []);
+
+  const deleteTeam = useCallback(
     (id: string) => {
-      setArmedId((cur) => {
-        if (cur === null) return id; // arm A
-        if (cur === id) return null; // picked self → cancel
-        const conn: Connection = {
-          source: cur,
-          target: id,
-          sourceHandle: null,
-          targetHandle: null,
-        };
-        setEdges((eds) => addEdge(conn, eds)); // link A→B
-        return null; // disarm after linking
+      // Ephemeral compose state — dropping a team's tagged edges is fine.
+      setEdges((es) => es.filter((e) => e.data?.teamId !== id));
+      setResults((r) => {
+        const { [id]: _drop, ...rest } = r;
+        return rest;
+      });
+      setTeams((ts) => {
+        const next = ts.filter((t) => t.id !== id);
+        // Keep at least one team so the pen always has ink.
+        if (next.length === 0) {
+          const fresh = newTeam(0);
+          setActiveTeamId(fresh.id);
+          return [fresh];
+        }
+        setActiveTeamId((cur) => (cur === id ? next[0].id : cur));
+        return next;
       });
     },
     [setEdges],
   );
 
+  // Flash the freshest link for a connect pulse, then settle.
+  const flash = useCallback((id: string) => {
+    setRecentEdge(id);
+    if (flashTimer.current) clearTimeout(flashTimer.current);
+    flashTimer.current = setTimeout(() => setRecentEdge(null), 720);
+  }, []);
+
+  // Add a team-tagged edge (deduped within the team, either direction).
+  const link = useCallback(
+    (a: string, b: string, teamId: string) => {
+      if (!a || !b || a === b) return;
+      const id = edgeId(teamId, a, b);
+      const rev = edgeId(teamId, b, a);
+      setEdges((es) =>
+        es.some((e) => e.id === id || e.id === rev)
+          ? es
+          : [...es, { id, source: a, target: b, data: { teamId } }],
+      );
+      flash(id);
+    },
+    [setEdges, flash],
+  );
+
+  // Arm-or-link into the ACTIVE team: first pick arms A (amber), second links
+  // A→B and adds both to the active team; picking A again cancels.
+  const armOrLink = useCallback(
+    (id: string) => {
+      setArmedId((cur) => {
+        if (cur === null) return id;
+        if (cur === id) return null;
+        link(cur, id, activeTeamId);
+        return null;
+      });
+    },
+    [link, activeTeamId],
+  );
+
+  // Drag-to-connect also tags the active team.
+  const onConnect = useCallback(
+    (c: Connection) => link(c.source, c.target, activeTeamId),
+    [link, activeTeamId],
+  );
+
   const onNodeClick: NodeMouseHandler<OracleNodeType> = useCallback(
-    (_event, node) => armOrLink(node.id),
+    (_e, node) => armOrLink(node.id),
     [armOrLink],
   );
-
-  // Click empty canvas → cancel a pending link.
   const onPaneClick = useCallback(() => setArmedId(null), []);
 
-  const onNodeMouseEnter: NodeMouseHandler<OracleNodeType> = useCallback(
-    (_event, node) => setHoveredId(node.id),
-    [],
-  );
-  const onNodeMouseLeave: NodeMouseHandler<OracleNodeType> = useCallback(
-    () => setHoveredId(null),
-    [],
+  const onMove = useCallback((_e: unknown, vp: Viewport) => {
+    viewportRef.current = vp;
+  }, []);
+
+  // ── Derive membership + staging every render (single source of truth) ──
+  const membersMap = useMemo(() => membersByTeam(edges), [edges]);
+  const nodeTeamsMap = useMemo(() => teamsForNode(edges), [edges]);
+  const colorOf = useCallback(
+    (id: string | null | undefined) =>
+      id ? teams.find((t) => t.id === id)?.color : undefined,
+    [teams],
   );
 
-  // Union-find over drawn edges → components.
-  const nodeIds = useMemo(() => nodes.map((n) => n.id), [nodes]);
-  const uf = useMemo(
-    () =>
-      buildUnionFind(
-        nodeIds,
-        edges.map((e) => ({ source: e.source, target: e.target })),
-      ),
-    [nodeIds, edges],
+  // The team ON STAGE: hovered team row wins, else the active (pen) team.
+  const stagedTeamId = hoverTeamId ?? activeTeamId;
+  const stageMembers = useMemo(
+    () => membersMap.get(stagedTeamId) ?? new Set<string>(),
+    [membersMap, stagedTeamId],
   );
-  const groups = useMemo(() => uf.groups(), [uf]);
-  const hoverComponent = useMemo(
-    () => (hoveredId ? uf.componentOf(hoveredId) : []),
-    [uf, hoveredId],
+  const anyStaged = stageMembers.size > 0;
+  const stagedColor = colorOf(stagedTeamId);
+
+  const activeMembers = useMemo(
+    () => [...(membersMap.get(activeTeamId) ?? [])],
+    [membersMap, activeTeamId],
   );
 
-  // The team the user is about to form: the hovered component, else the
-  // largest drawn component.
-  const target = useMemo(
-    () => (hoverComponent.length >= 2 ? hoverComponent : (groups[0] ?? [])),
-    [hoverComponent, groups],
-  );
-
-  // Glow whichever component is currently the target.
-  const highlightSet = useMemo(() => new Set(target), [target]);
   const displayNodes = useMemo(
     () =>
       nodes.map((n) => {
-        const hi = highlightSet.has(n.id);
-        const armed = armedId === n.id;
-        return n.data.highlighted === hi && n.data.armed === armed
-          ? n
-          : { ...n, data: { ...n.data, highlighted: hi, armed } };
+        const stage: "on" | "off" | "neutral" = !anyStaged
+          ? "neutral"
+          : stageMembers.has(n.id)
+            ? "on"
+            : "off";
+        const tIds = [...(nodeTeamsMap.get(n.id) ?? [])];
+        const teamColors = tIds
+          .map((t) => colorOf(t))
+          .filter((c): c is string => Boolean(c));
+        return {
+          ...n,
+          zIndex: stage === "on" ? 20 : 1,
+          data: {
+            ...n.data,
+            armed: armedId === n.id,
+            stage,
+            teamColors,
+            teamColor: stage === "on" ? stagedColor : undefined,
+          },
+        };
       }),
-    [nodes, highlightSet, armedId],
+    [nodes, anyStaged, stageMembers, nodeTeamsMap, colorOf, armedId, stagedColor],
   );
 
-  // Edges glow when they connect the currently-targeted team; the rest recede.
+  // One styled edge per tagged edge, colored by its team. The staged team's
+  // edges are bright + flow-animated; the rest recede but stay visible.
   const displayEdges = useMemo(
     () =>
       edges.map((e) => {
-        const inTeam = highlightSet.has(e.source) && highlightSet.has(e.target);
+        const tid = e.data?.teamId;
+        const c = colorOf(tid) ?? "#64b5f6";
+        const onStage = anyStaged && tid === stagedTeamId;
+        const cls = [
+          onStage ? "is-team" : "",
+          e.id === recentEdge ? "just-linked" : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
         return {
           ...e,
-          className: inTeam ? "is-team" : undefined,
+          className: cls || undefined,
           animated: false,
-          style: inTeam
-            ? {
-                stroke: "#64d3ff",
-                strokeWidth: 2,
-                filter: "drop-shadow(0 0 6px rgba(100,211,255,0.8))",
-              }
-            : { stroke: "#2b3546", strokeWidth: 1.5 },
+          style: {
+            stroke: c,
+            strokeWidth: onStage ? 2.4 : 1.5,
+            opacity: onStage ? 1 : 0.28,
+            ...(onStage
+              ? { filter: `drop-shadow(0 0 6px ${c}bb)` }
+              : {}),
+          },
         };
       }),
-    [edges, highlightSet],
+    [edges, colorOf, anyStaged, stagedTeamId, recentEdge],
   );
 
   const liveCount = useMemo(
-    () => nodes.filter((n) => n.data.status === "active" || n.data.status === "idle").length,
+    () =>
+      nodes.filter(
+        (n) => n.data.status === "active" || n.data.status === "idle",
+      ).length,
     [nodes],
   );
 
-  const canSubmit = edges.length >= 1 && target.length >= 2 && !busy;
-
-  const submit = useCallback(async () => {
-    if (target.length < 2 || busy) return;
-    setBusy(true);
-    setResult(null);
-    try {
-      const res = await fetch("/api/synapse/team", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ members: target, dryRun }),
+  // ── Fan-out ────────────────────────────────────────────────────────────
+  const submitTeam = useCallback(
+    async (team: Team, members: string[], dry: boolean) => {
+      if (members.length < 2 || busyTeam) return;
+      setBusyTeam(team.id);
+      setResults((r) => {
+        const { [team.id]: _drop, ...rest } = r;
+        return rest;
       });
-      setResult((await res.json()) as TeamResponse);
-    } catch (e: unknown) {
-      setResult({
-        ok: false,
-        sent: [],
-        dryRun,
-        error: e instanceof Error ? e.message : String(e),
-      });
-    } finally {
-      setBusy(false);
-    }
-  }, [target, dryRun, busy]);
+      try {
+        const res = await fetch("/api/synapse/team", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            members,
+            teamName: team.name,
+            dryRun: dry,
+          }),
+        });
+        const json = (await res.json()) as TeamResponse;
+        setResults((r) => ({ ...r, [team.id]: json }));
+      } catch (e: unknown) {
+        setResults((r) => ({
+          ...r,
+          [team.id]: {
+            ok: false,
+            sent: [],
+            dryRun: dry,
+            error: e instanceof Error ? e.message : String(e),
+          },
+        }));
+      } finally {
+        setBusyTeam(null);
+      }
+    },
+    [busyTeam],
+  );
 
-  // Cmd/Ctrl+Enter to form the team.
+  // Form the ACTIVE team (⌘↵ + panel).
+  const submitActive = useCallback(() => {
+    if (active) void submitTeam(active, activeMembers, dryRun);
+  }, [active, activeMembers, dryRun, submitTeam]);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
@@ -244,24 +369,36 @@ export default function App() {
       if (e.key === "Escape") setArmedId(null);
       if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
         e.preventDefault();
-        void submit();
+        submitActive();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [submit]);
+  }, [submitActive]);
 
-  // ⌘K palette items: actions first, then every oracle (arm/link by keyboard).
+  // ── ⌘K palette ─────────────────────────────────────────────────────────
   const paletteItems = useMemo<PaletteItem[]>(() => {
     const actions: PaletteItem[] = [
       {
-        id: "action:form",
-        label: dryRun ? "Preview team" : "Form team",
+        id: "action:newteam",
+        label: "New Team",
         section: "Actions",
-        hint: target.length >= 2 ? `⌘↵ · ${target.length}` : "need a team",
-        disabled: target.length < 2,
+        hint: "+",
         run: () => {
-          void submit();
+          addTeam();
+          return true; // keep palette open to immediately pick oracles
+        },
+      },
+      {
+        id: "action:form",
+        label: active
+          ? `${dryRun ? "Preview" : "Form"} «${active.name}»`
+          : "Form team",
+        section: "Actions",
+        hint: activeMembers.length >= 2 ? `⌘↵ · ${activeMembers.length}` : "need 2+",
+        disabled: activeMembers.length < 2,
+        run: () => {
+          submitActive();
         },
       },
       {
@@ -272,14 +409,25 @@ export default function App() {
         run: () => setDryRun((d) => !d),
       },
       {
-        id: "action:clear",
-        label: "Clear all links",
+        id: "action:clearactive",
+        label: active ? `Clear links of «${active.name}»` : "Clear active links",
         section: "Actions",
-        hint: `${edges.length}`,
-        disabled: edges.length === 0,
-        run: () => setEdges([]),
+        hint: `${activeMembers.length}`,
+        disabled: !active || activeMembers.length === 0,
+        run: () =>
+          setEdges((es) => es.filter((e) => e.data?.teamId !== activeTeamId)),
       },
     ];
+    const teamItems: PaletteItem[] = teams.map((t) => ({
+      id: `team:${t.id}`,
+      label: `Stage «${t.name}»`,
+      section: "Teams",
+      hint: t.id === activeTeamId ? "active" : `${membersMap.get(t.id)?.size ?? 0}`,
+      dotColor: t.color,
+      run: () => {
+        setActiveTeamId(t.id);
+      },
+    }));
     const oracleItems: PaletteItem[] = nodes.map((n) => ({
       id: `oracle:${n.id}`,
       label: n.id,
@@ -292,11 +440,24 @@ export default function App() {
         return willArm; // keep palette open after arming, so you can pick B
       },
     }));
-    return [...actions, ...oracleItems];
-  }, [nodes, armedId, dryRun, target.length, edges.length, submit, armOrLink, setEdges]);
+    return [...actions, ...teamItems, ...oracleItems];
+  }, [
+    nodes,
+    teams,
+    active,
+    activeTeamId,
+    activeMembers.length,
+    membersMap,
+    armedId,
+    dryRun,
+    addTeam,
+    submitActive,
+    armOrLink,
+    setEdges,
+  ]);
 
   return (
-    <div className="hud-space relative h-screen w-screen">
+    <div className="hud-space relative h-screen w-screen overflow-hidden">
       {/* Header */}
       <header className="pointer-events-none absolute left-0 top-0 z-10 flex items-center gap-3 px-5 py-4">
         <div className="flex items-baseline gap-2.5">
@@ -315,7 +476,7 @@ export default function App() {
           </span>
         </div>
         <span className="hidden font-mono text-[11px] uppercase tracking-wide text-neutral-600 sm:inline">
-          tap an oracle · then another · to link a team
+          tap oracles to link a team · click a team to stage it
         </span>
         {mock && (
           <span className="rounded-md bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-400">
@@ -329,6 +490,9 @@ export default function App() {
         )}
       </header>
 
+      {/* Living background — painted BEHIND the transparent ReactFlow. */}
+      <SpaceField viewportRef={viewportRef} />
+
       <ReactFlow
         nodes={displayNodes}
         edges={displayEdges}
@@ -337,18 +501,26 @@ export default function App() {
         onConnect={onConnect}
         onNodeClick={onNodeClick}
         onPaneClick={onPaneClick}
-        onNodeMouseEnter={onNodeMouseEnter}
-        onNodeMouseLeave={onNodeMouseLeave}
+        onMove={onMove}
+        onInit={(i) => {
+          viewportRef.current = i.getViewport();
+        }}
         nodeTypes={nodeTypes}
-        defaultEdgeOptions={defaultEdgeOptions}
         fitView
         fitViewOptions={{ padding: 0.28, maxZoom: 1.1 }}
         minZoom={0.4}
         maxZoom={1.6}
         proOptions={{ hideAttribution: true }}
         colorMode="dark"
+        style={{ background: "transparent" }}
       >
-        <Background color="#1a2740" gap={30} size={1} />
+        <Background
+          variant={BackgroundVariant.Dots}
+          color="#1a2740"
+          gap={34}
+          size={1}
+          style={{ opacity: 0.5 }}
+        />
         <Controls showInteractive={false} />
         <MiniMap
           pannable
@@ -368,7 +540,7 @@ export default function App() {
         />
       </ReactFlow>
 
-      {/* Armed prompt — clear feedback that a link is in progress. */}
+      {/* Armed prompt */}
       {armedId && (
         <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2">
           <div
@@ -381,14 +553,17 @@ export default function App() {
               boxShadow: "0 0 24px rgba(245,158,11,0.25)",
             }}
           >
-            ▸ linking from <b className="font-semibold">{armedId}</b> · tap
-            another · esc to cancel
+            ▸ linking into{" "}
+            <b className="font-semibold" style={{ color: active?.color }}>
+              {active?.name}
+            </b>{" "}
+            from <b className="font-semibold">{armedId}</b> · tap another · esc
           </div>
         </div>
       )}
 
-      {/* Team-forming panel */}
-      <div className="absolute bottom-4 right-4 z-10 w-80 max-w-[calc(100vw-2rem)]">
+      {/* Teams panel */}
+      <div className="absolute bottom-4 right-4 z-10 w-[22rem] max-w-[calc(100vw-2rem)]">
         <div
           className="rounded-xl border p-4 shadow-2xl"
           style={{
@@ -401,110 +576,168 @@ export default function App() {
           }}
         >
           <div className="flex items-center justify-between">
-            <span className="text-sm font-semibold text-neutral-100">
-              Form Team
-            </span>
-            <label className="flex cursor-pointer select-none items-center gap-2 text-xs text-neutral-300">
-              <input
-                type="checkbox"
-                checked={dryRun}
-                onChange={(e) => setDryRun(e.target.checked)}
-                className="h-3.5 w-3.5 accent-[#64b5f6]"
-              />
-              dry run
-            </label>
+            <span className="text-sm font-semibold text-neutral-100">Teams</span>
+            <div className="flex items-center gap-3">
+              <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-neutral-300">
+                <input
+                  type="checkbox"
+                  checked={dryRun}
+                  onChange={(e) => setDryRun(e.target.checked)}
+                  className="h-3.5 w-3.5 accent-[#64b5f6]"
+                />
+                dry run
+              </label>
+              <button
+                type="button"
+                onClick={addTeam}
+                className="rounded-md px-2 py-1 text-xs font-semibold transition-colors"
+                style={{ background: "rgba(100,181,246,0.16)", color: "#8fd0ff" }}
+              >
+                + New Team
+              </button>
+            </div>
           </div>
 
-          <div className="mt-3 min-h-[1.5rem]">
-            {target.length >= 2 ? (
-              <div className="flex flex-wrap gap-1.5">
-                {target.map((m) => (
-                  <span
-                    key={m}
-                    className="rounded-full px-2 py-0.5 text-xs"
-                    style={{
-                      background: "rgba(100,181,246,0.12)",
-                      color: "#64b5f6",
-                    }}
-                  >
-                    {m}
-                  </span>
-                ))}
-              </div>
-            ) : (
+          <div className="mt-3 max-h-[52vh] space-y-2 overflow-y-auto pr-0.5">
+            {teams.length === 0 && (
               <p className="text-xs text-neutral-500">
-                Draw an edge between two oracles, then hover a team.
+                No teams yet — + New Team, then tap two oracles.
               </p>
             )}
+            {teams.map((t) => {
+              const members = [...(membersMap.get(t.id) ?? [])];
+              const isActive = t.id === activeTeamId;
+              const res = results[t.id];
+              return (
+                <div
+                  key={t.id}
+                  onClick={() => setActiveTeamId(t.id)}
+                  onMouseEnter={() => setHoverTeamId(t.id)}
+                  onMouseLeave={() => setHoverTeamId(null)}
+                  className="cursor-pointer rounded-lg border p-2.5 transition-colors"
+                  style={{
+                    borderColor: isActive
+                      ? t.color
+                      : "rgba(100,181,246,0.12)",
+                    borderLeftWidth: isActive ? 3 : 1,
+                    background: isActive
+                      ? "rgba(100,181,246,0.06)"
+                      : "rgba(255,255,255,0.02)",
+                  }}
+                >
+                  <div className="flex items-center gap-2">
+                    <span
+                      className="inline-block h-2.5 w-2.5 shrink-0 rounded-full"
+                      style={{ background: t.color, boxShadow: `0 0 6px ${t.color}` }}
+                    />
+                    {editingId === t.id ? (
+                      <input
+                        autoFocus
+                        value={t.name}
+                        onClick={(e) => e.stopPropagation()}
+                        onChange={(e) => renameTeam(t.id, e.target.value)}
+                        onBlur={() => setEditingId(null)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === "Escape")
+                            setEditingId(null);
+                        }}
+                        className="min-w-0 flex-1 rounded bg-black/30 px-1.5 py-0.5 text-[13px] font-semibold text-neutral-100 focus:outline-none"
+                        style={{ boxShadow: `inset 0 0 0 1px ${t.color}66` }}
+                      />
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setActiveTeamId(t.id);
+                          setEditingId(t.id);
+                        }}
+                        className="min-w-0 flex-1 truncate text-left text-[13px] font-semibold text-neutral-100"
+                        title="click to rename"
+                      >
+                        {t.name}
+                      </button>
+                    )}
+                    <span className="shrink-0 font-mono text-[11px] tabular-nums text-neutral-500">
+                      {members.length}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        deleteTeam(t.id);
+                      }}
+                      className="shrink-0 rounded px-1 text-sm leading-none text-neutral-600 transition-colors hover:text-red-400"
+                      title="delete team"
+                    >
+                      ✕
+                    </button>
+                  </div>
+
+                  {members.length > 0 ? (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {members.map((m) => (
+                        <span
+                          key={m}
+                          className="rounded-full px-1.5 py-0.5 text-[11px]"
+                          style={{
+                            background: `${t.color}1f`,
+                            color: t.color,
+                          }}
+                        >
+                          {m}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="mt-1.5 text-[11px] text-neutral-600">
+                      tap two oracles to add members
+                    </p>
+                  )}
+
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void submitTeam(t, members, dryRun);
+                      }}
+                      disabled={members.length < 2 || busyTeam === t.id}
+                      className="rounded-md px-2.5 py-1 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40"
+                      style={{ background: t.color, color: "#0a0a0f" }}
+                    >
+                      {busyTeam === t.id
+                        ? "Sending…"
+                        : dryRun
+                          ? "Preview"
+                          : "Form"}
+                    </button>
+                    {res && (
+                      <span
+                        className="font-mono text-[11px]"
+                        style={{ color: res.ok ? "#34e5b0" : "#ef4444" }}
+                      >
+                        {res.dryRun ? "preview" : "sent"} · {res.sent.length}
+                      </span>
+                    )}
+                  </div>
+
+                  {res?.error && (
+                    <p className="mt-1 text-[11px] text-red-400">{res.error}</p>
+                  )}
+                  {res?.sent[0] && (
+                    <p className="mt-1.5 border-t border-white/5 pt-1.5 text-[11px] leading-relaxed text-neutral-400">
+                      {res.sent[0].message}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
           </div>
 
-          {groups.length > 1 && (
-            <p className="mt-2 text-xs text-neutral-500">
-              {groups.length} teams drawn — hover one to target it.
-            </p>
-          )}
-
-          <button
-            type="button"
-            onClick={() => void submit()}
-            disabled={!canSubmit}
-            className="mt-3 w-full rounded-lg px-3 py-2 text-sm font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-40"
-            style={{ background: "#64b5f6", color: "#0a0a0f" }}
-          >
-            {busy
-              ? "Sending…"
-              : dryRun
-                ? `Preview team (${target.length || 0})`
-                : `Form team (${target.length || 0})`}
-          </button>
-          <p className="mt-1.5 text-center text-[11px] text-neutral-600">
-            ⌘/Ctrl + Enter
+          <p className="mt-2 text-center text-[11px] text-neutral-600">
+            active team = ⌘/Ctrl + Enter · one oracle can join many teams
           </p>
-
-          {result && (
-            <div
-              className="mt-3 rounded-lg border p-3"
-              style={{ borderColor: "#2a2a35", background: "#0d0d14" }}
-            >
-              <div className="flex items-center justify-between text-xs">
-                <span
-                  className="font-semibold"
-                  style={{ color: result.ok ? "#22c55e" : "#ef4444" }}
-                >
-                  {result.dryRun ? "Dry-run preview" : "Sent"}
-                </span>
-                <span className="text-neutral-500">
-                  {result.sent.length} member{result.sent.length === 1 ? "" : "s"}
-                </span>
-              </div>
-              {result.error && (
-                <p className="mt-1 text-xs text-red-400">{result.error}</p>
-              )}
-              <ul className="mt-2 space-y-1.5">
-                {result.sent.map((s) => (
-                  <li key={s.member} className="text-xs">
-                    <div className="flex items-center gap-1.5">
-                      <span
-                        className="inline-block h-1.5 w-1.5 rounded-full"
-                        style={{ background: s.ok ? "#22c55e" : "#ef4444" }}
-                      />
-                      <span className="font-medium text-neutral-200">
-                        {s.member}
-                      </span>
-                    </div>
-                    <code className="mt-0.5 block truncate text-[10px] text-neutral-500">
-                      {s.command}
-                    </code>
-                  </li>
-                ))}
-              </ul>
-              {result.sent[0] && (
-                <p className="mt-2 border-t pt-2 text-[11px] leading-relaxed text-neutral-400" style={{ borderColor: "#2a2a35" }}>
-                  {result.sent[0].message}
-                </p>
-              )}
-            </div>
-          )}
         </div>
       </div>
 

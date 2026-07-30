@@ -11,7 +11,9 @@
 
 /* ── HUD ambience ─────────────────────────────────────────────────────── */
 
-/* Deep-space ground: radial core glow + faint scan grid behind the canvas. */
+/* Deep-space ground: radial core glow. The animated SpaceField canvas layers
+   parallax stars + breathing nebula on TOP of this base color floor, and the
+   transparent ReactFlow renders above that. */
 .hud-space {
   background-color: #06070c;
   background-image:
@@ -45,43 +47,6 @@
   animation: hud-ping 2.4s cubic-bezier(0.16, 1, 0.3, 1) infinite;
 }
 
-/* Slow border sheen for live tiles. */
-@keyframes hud-breathe {
-  0%,
-  100% {
-    opacity: 0.45;
-  }
-  50% {
-    opacity: 0.9;
-  }
-}
-.hud-breathe {
-  animation: hud-breathe 3.2s ease-in-out infinite;
-}
-
-/* Node entrance. */
-@keyframes hud-rise {
-  from {
-    opacity: 0;
-    transform: translateY(6px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-/* Neon flow along connected edges. */
-.react-flow__edge.is-team .react-flow__edge-path {
-  stroke-dasharray: 6 6;
-  animation: hud-flow 0.6s linear infinite;
-}
-@keyframes hud-flow {
-  to {
-    stroke-dashoffset: -12;
-  }
-}
-
 /* Corner brackets. */
 .hud-corner {
   position: absolute;
@@ -92,10 +57,124 @@
   transition: opacity 0.2s ease;
 }
 
+/* ── Fake-3D depth compositor ─────────────────────────────────────────── */
+/* Perspective lives on OUR node root only — never on .react-flow__viewport /
+   __node / __pane (xyflow overwrites those with matrix() every frame, which
+   would flatten preserve-3d). Tilt (--rx/--ry) and staging (--z/--s) compose
+   into ONE transform string via the CSS var cascade — no JS coordination. */
+.oracle-persp {
+  perspective: 900px;
+}
+.oracle-card {
+  --rx: 0deg;
+  --ry: 0deg;
+  --z: 0px;
+  --s: 1;
+  transform: translateZ(var(--z)) rotateX(var(--rx)) rotateY(var(--ry))
+    scale(var(--s));
+  transform-style: preserve-3d;
+  transition:
+    transform 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+    filter 0.28s ease,
+    opacity 0.28s ease,
+    border-color 0.28s ease;
+  will-change: transform;
+}
+
+/* Staging: members of the on-stage team rise, brighten, glow in team color. */
+.oracle-persp[data-stage="on"] .oracle-card {
+  --z: 60px;
+  --s: 1.07;
+  filter: brightness(1.12) saturate(1.08)
+    drop-shadow(0 22px 40px rgba(0, 0, 0, 0.6))
+    drop-shadow(0 0 16px var(--accent, #64b5f6));
+}
+.oracle-persp[data-stage="on"] .hud-corner {
+  opacity: 1;
+}
+/* Recede: non-members sink, shrink, blur, dim — the stage backdrop. */
+.oracle-persp[data-stage="off"] .oracle-card {
+  --z: -40px;
+  --s: 0.9;
+  filter: blur(1.4px) brightness(0.62);
+  opacity: 0.42;
+}
+
+/* ── Organic "alive" drift ─────────────────────────────────────────────── */
+/* Applied to an INNER wrapper only — NEVER to xyflow node.position — so it can
+   never fight dragging, click-to-connect, or edge routing. Amplitude ≤6px. */
+@keyframes oracle-drift {
+  0% {
+    transform: translate(0, 0);
+  }
+  25% {
+    transform: translate(4px, -5px);
+  }
+  50% {
+    transform: translate(-3px, -2px);
+  }
+  75% {
+    transform: translate(-5px, 4px);
+  }
+  100% {
+    transform: translate(0, 0);
+  }
+}
+.oracle-drift {
+  animation: oracle-drift var(--drift-dur, 11s) ease-in-out infinite;
+  animation-delay: var(--drift-delay, 0s);
+  will-change: transform;
+}
+
+/* ── Edges ─────────────────────────────────────────────────────────────── */
+/* Neon energy-flow along the on-stage team's edges. */
+.react-flow__edge.is-team .react-flow__edge-path {
+  stroke-dasharray: 6 6;
+  animation: hud-flow 0.6s linear infinite;
+}
+@keyframes hud-flow {
+  to {
+    stroke-dashoffset: -12;
+  }
+}
+/* Connect pulse — a fresh link flares briefly, then settles. */
+.react-flow__edge.just-linked .react-flow__edge-path {
+  animation: hud-connect 0.7s ease-out;
+}
+@keyframes hud-connect {
+  0% {
+    stroke-width: 5;
+    filter: drop-shadow(0 0 12px currentColor);
+    opacity: 1;
+  }
+  100% {
+    stroke-width: 2;
+    opacity: 1;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .hud-ping,
-  .hud-breathe,
-  .react-flow__edge.is-team .react-flow__edge-path {
+  .oracle-drift,
+  .react-flow__edge.is-team .react-flow__edge-path,
+  .react-flow__edge.just-linked .react-flow__edge-path {
     animation: none !important;
+  }
+  /* Kill tilt + lift, but KEEP the static staging (scale/dim) — staging is
+     information (which team is on stage), not decoration. */
+  .oracle-card {
+    transition: none;
+  }
+  .oracle-persp[data-stage] .oracle-card {
+    --rx: 0deg;
+    --ry: 0deg;
+    --z: 0px;
+  }
+  .oracle-persp[data-stage="on"] .oracle-card {
+    filter: none;
+  }
+  .oracle-persp[data-stage="off"] .oracle-card {
+    filter: brightness(0.62);
+    --s: 0.92;
   }
 }

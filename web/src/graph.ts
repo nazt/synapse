@@ -1,70 +1,70 @@
-// Union-find over the drawn edges → connected components (teams).
-// A–B, B–C ⇒ {A,B,C}. Disjoint edge sets ⇒ multiple teams on one canvas.
+// Explicit named teams — NOT connected components.
+//
+// The old model ran union-find over every drawn edge: A–B and B–C collapsed
+// into ONE team {A,B,C}, and any oracle shared between two links merged the two
+// teams. That structurally forbids multi-membership.
+//
+// New model: teams are first-class { id, name, color } objects. Each drawn edge
+// is TAGGED with a teamId. A team's members are the unique node ids touched by
+// that team's edges — derived every render (single source of truth; deleting an
+// edge can never leave a stale member). A node touched by a Team-A edge AND a
+// Team-B edge is simply in BOTH member sets — nothing pulls A and B together.
 
-type EdgeLike = { source: string; target: string };
+import type { Edge } from "@xyflow/react";
 
-export type UnionFind = {
-  /** Root representative for a node id. */
-  find: (id: string) => string;
-  /** All components with 2+ members, largest first. */
-  groups: () => string[][];
-  /** The component (member ids) containing `id`; [] if unknown/singleton. */
-  componentOf: (id: string) => string[];
-};
+export type Team = { id: string; name: string; color: string };
+export type TeamEdgeData = { teamId: string };
 
-export function buildUnionFind(nodeIds: string[], edges: EdgeLike[]): UnionFind {
-  const parent = new Map<string, string>();
-  for (const id of nodeIds) parent.set(id, id);
+// ~8 distinct, on-theme hues. New Team walks the ring by team count.
+export const TEAM_PALETTE = [
+  "#64b5f6", // Neo blue
+  "#34e5b0", // emerald
+  "#f59e0b", // amber
+  "#c084fc", // violet
+  "#f472b6", // pink
+  "#22d3ee", // cyan
+  "#a3e635", // lime
+  "#fb7185", // rose
+];
 
-  const find = (id: string): string => {
-    let root = parent.get(id);
-    if (root === undefined) return id; // unknown node — treat as its own root
-    while (root !== parent.get(root)) {
-      const next = parent.get(root);
-      if (next === undefined) break;
-      root = next;
-    }
-    // Path compression.
-    let cur = id;
-    while (cur !== root) {
-      const next = parent.get(cur);
-      if (next === undefined) break;
-      parent.set(cur, root);
-      cur = next;
-    }
-    return root;
-  };
-
-  const union = (a: string, b: string) => {
-    if (!parent.has(a) || !parent.has(b)) return;
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent.set(ra, rb);
-  };
-
-  for (const e of edges) union(e.source, e.target);
-
-  const buckets = (): Map<string, string[]> => {
-    const map = new Map<string, string[]>();
-    for (const id of nodeIds) {
-      const root = find(id);
-      const arr = map.get(root);
-      if (arr) arr.push(id);
-      else map.set(root, [id]);
-    }
-    return map;
-  };
-
+export function newTeam(n: number): Team {
   return {
-    find,
-    groups: () =>
-      [...buckets().values()]
-        .filter((g) => g.length >= 2)
-        .sort((a, b) => b.length - a.length),
-    componentOf: (id) => {
-      const root = find(id);
-      const g = buckets().get(root) ?? [];
-      return g.length >= 2 ? g : [];
-    },
+    id: crypto.randomUUID(),
+    name: `Team ${n + 1}`,
+    color: TEAM_PALETTE[n % TEAM_PALETTE.length],
   };
+}
+
+function edgeTeamId(e: Edge): string | undefined {
+  const d = e.data as Partial<TeamEdgeData> | undefined;
+  return typeof d?.teamId === "string" ? d.teamId : undefined;
+}
+
+// teamId → set of member node ids (both endpoints of every tagged edge).
+export function membersByTeam(edges: Edge[]): Map<string, Set<string>> {
+  const m = new Map<string, Set<string>>();
+  for (const e of edges) {
+    const t = edgeTeamId(e);
+    if (!t) continue;
+    const s = m.get(t) ?? new Set<string>();
+    s.add(e.source);
+    s.add(e.target);
+    m.set(t, s);
+  }
+  return m;
+}
+
+// Inverse: node id → set of teamIds it belongs to (for multi-ring rendering).
+export function teamsForNode(edges: Edge[]): Map<string, Set<string>> {
+  const m = new Map<string, Set<string>>();
+  for (const e of edges) {
+    const t = edgeTeamId(e);
+    if (!t) continue;
+    for (const n of [e.source, e.target]) {
+      const s = m.get(n) ?? new Set<string>();
+      s.add(t);
+      m.set(n, s);
+    }
+  }
+  return m;
 }

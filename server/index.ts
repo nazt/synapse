@@ -260,10 +260,14 @@ async function runMawCensus(): Promise<OracleNodeData[]> {
 // member via `maw hey <member> -f <file>` (bytes-through: dodges the
 // bracket-trap and the backtick/$/quote shell-escape scars).
 
-function buildInviteMessage(members: string[]): string {
+function buildInviteMessage(members: string[], teamName?: string): string {
   const list = members.join(", ");
+  const name = teamName?.trim();
   // MUST NOT start with '[' — `maw hey` rejects a bracket-prefixed body
   // (it auto-signs a federation tag). A leading emoji/word is safe.
+  if (name) {
+    return `ทีม ${name} พร้อมแล้วครับ 🔗 สมาชิก: ${list} — สร้างจาก Synapse`;
+  }
   return `เราเป็นทีมเดียวกันแล้วครับ 🔗 สมาชิก: ${list} — สร้างทีมนี้จาก Synapse`;
 }
 
@@ -278,8 +282,9 @@ type SentEntry = {
 async function fanOutTeam(
   members: string[],
   dryRun: boolean,
+  teamName?: string,
 ): Promise<SentEntry[]> {
-  const message = buildInviteMessage(members);
+  const message = buildInviteMessage(members, teamName);
 
   // One temp file, shared across members (same team message for everyone).
   const file = join(
@@ -460,12 +465,15 @@ const app = new Elysia()
       // query dryRun=false/0) unlocks a real send; anything else stays a preview.
       const dryRun =
         body.dryRun ?? !(query.dryRun === "false" || query.dryRun === "0");
-      const sent = await fanOutTeam(members, dryRun);
+      const teamName =
+        typeof body.teamName === "string" ? body.teamName : undefined;
+      const sent = await fanOutTeam(members, dryRun, teamName);
       return { ok: sent.every((s) => s.ok), sent, dryRun };
     },
     {
       body: t.Object({
         members: t.Array(t.String()),
+        teamName: t.Optional(t.String()),
         dryRun: t.Optional(t.Boolean()),
       }),
       query: t.Object({
