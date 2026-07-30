@@ -40,6 +40,7 @@ export default function App() {
   const [nodes, setNodes, onNodesChange] = useNodesState<OracleNodeType>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const [armedId, setArmedId] = useState<string | null>(null);
   const [dryRun, setDryRun] = useState(true);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<TeamResponse | null>(null);
@@ -59,7 +60,7 @@ export default function App() {
             id: o.name,
             type: "oracle" as const,
             position: layout(res.oracles.length, i),
-            data: { ...o, highlighted: false },
+            data: { ...o, highlighted: false, armed: false },
           })),
         );
       })
@@ -75,6 +76,29 @@ export default function App() {
     (connection: Connection) => setEdges((eds) => addEdge(connection, eds)),
     [setEdges],
   );
+
+  // Click-to-connect (the easy path — no precise handle-dragging):
+  // tap oracle A → it arms (amber); tap oracle B → edge A→B; tap A again → cancel.
+  const onNodeClick: NodeMouseHandler<OracleNodeType> = useCallback(
+    (_event, node) => {
+      setArmedId((cur) => {
+        if (cur === null) return node.id; // arm A
+        if (cur === node.id) return null; // tapped self → cancel
+        const conn: Connection = {
+          source: cur,
+          target: node.id,
+          sourceHandle: null,
+          targetHandle: null,
+        };
+        setEdges((eds) => addEdge(conn, eds)); // link A→B
+        return null; // disarm after linking
+      });
+    },
+    [setEdges],
+  );
+
+  // Click empty canvas → cancel a pending link.
+  const onPaneClick = useCallback(() => setArmedId(null), []);
 
   const onNodeMouseEnter: NodeMouseHandler<OracleNodeType> = useCallback(
     (_event, node) => setHoveredId(node.id),
@@ -114,11 +138,12 @@ export default function App() {
     () =>
       nodes.map((n) => {
         const hi = highlightSet.has(n.id);
-        return n.data.highlighted === hi
+        const armed = armedId === n.id;
+        return n.data.highlighted === hi && n.data.armed === armed
           ? n
-          : { ...n, data: { ...n.data, highlighted: hi } };
+          : { ...n, data: { ...n.data, highlighted: hi, armed } };
       }),
-    [nodes, highlightSet],
+    [nodes, highlightSet, armedId],
   );
 
   const canSubmit = edges.length >= 1 && target.length >= 2 && !busy;
@@ -149,6 +174,7 @@ export default function App() {
   // Cmd/Ctrl+Enter to form the team.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setArmedId(null);
       if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
         e.preventDefault();
         void submit();
@@ -169,7 +195,7 @@ export default function App() {
           Synapse
         </h1>
         <span className="text-xs text-neutral-500">
-          drag a node’s edge to another to form a team
+          click an oracle, then another, to link them into a team
         </span>
         {mock && (
           <span className="rounded bg-amber-500/15 px-2 py-0.5 text-xs text-amber-400">
@@ -189,6 +215,8 @@ export default function App() {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
+        onNodeClick={onNodeClick}
+        onPaneClick={onPaneClick}
         onNodeMouseEnter={onNodeMouseEnter}
         onNodeMouseLeave={onNodeMouseLeave}
         nodeTypes={nodeTypes}
@@ -207,6 +235,23 @@ export default function App() {
           style={{ background: "#12121a" }}
         />
       </ReactFlow>
+
+      {/* Armed prompt — clear feedback that a link is in progress. */}
+      {armedId && (
+        <div className="pointer-events-none absolute left-1/2 top-4 z-20 -translate-x-1/2">
+          <div
+            className="rounded-full border px-4 py-1.5 text-xs font-medium shadow-lg"
+            style={{
+              background: "#171f2b",
+              borderColor: "#eab308",
+              color: "#eab308",
+            }}
+          >
+            🔗 linking from <b>{armedId}</b> — click another oracle · Esc to
+            cancel
+          </div>
+        </div>
+      )}
 
       {/* Team-forming panel */}
       <div className="absolute bottom-4 right-4 z-10 w-80 max-w-[calc(100vw-2rem)]">

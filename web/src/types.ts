@@ -9,12 +9,15 @@ export type OracleData = {
   idleSec: number;
   // UI-only: set true when this node is in the hovered/target component.
   highlighted: boolean;
+  // UI-only: set true when this node is the armed source of a pending
+  // click-to-connect (tap A, then tap B → edge A→B).
+  armed: boolean;
 };
 
 export type CensusResponse = {
   ok: boolean;
   mock: boolean;
-  oracles: Omit<OracleData, "highlighted">[];
+  oracles: Omit<OracleData, "highlighted" | "armed">[];
 };
 
 // A custom ReactFlow node carrying OracleData under the "oracle" type key.
