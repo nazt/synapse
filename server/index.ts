@@ -76,9 +76,19 @@ class LogTailer {
     this.offset = size;
     const parts = text.split("\n");
     this.buf = parts.pop() ?? ""; // trailing partial line (no newline yet)
-    for (const raw of parts.slice(-RING_CAP)) {
+    // Anchor ids to the file's absolute line ordinal (1-based) — a DURABLE
+    // anchor (line count) rather than a volatile counter — so ids stay stable
+    // across process restarts: line k of the file is always id k, no matter
+    // when the tailer (re)starts or how much of the tail the ring retains.
+    // `parts` holds every completed line; the ring keeps only the last
+    // RING_CAP, but each retained line carries its true position as its id, so
+    // a client reconnecting with a pre-restart Last-Event-ID still resumes.
+    const start = Math.max(0, parts.length - RING_CAP);
+    this.nextId = start + 1;
+    for (const raw of parts.slice(start)) {
       this.record(stripCr(raw));
     }
+    // nextId now === parts.length + 1 — the ordinal of the next appended line.
   }
 
   ensureRunning(): void {
@@ -113,8 +123,13 @@ class LogTailer {
     }
   }
 
-  // Register a subscriber, replaying any buffered lines newer than lastEventId
-  // (undefined / NaN → replay the whole ring for immediate context).
+  // Register a subscriber, replaying any buffered lines newer than lastEventId.
+  // A fresh connection with no/NaN Last-Event-ID replays the ENTIRE ring (up to
+  // RING_CAP seeded lines) as real id:/data: events before live tailing — this
+  // is intentional context priming. Consumers that must distinguish history
+  // from new appends should track Last-Event-ID (each event carries a stable
+  // id:) and send it on reconnect, rather than assuming every data: event is a
+  // brand-new append.
   addSub(sub: Subscriber, lastEventId?: number): void {
     const from = Number.isFinite(lastEventId) ? (lastEventId as number) : 0;
     for (const e of this.ring) {
@@ -279,7 +294,16 @@ async function fanOutTeam(
   for (const member of members) {
     const command = `maw hey ${member} -f ${file}`;
     if (dryRun) {
-      results.push({ member, command, message, ok: true });
+      // Preview only — the temp file at `${file}` is NOT written in dryRun
+      // (Bun.write is guarded below). Prefix a shell comment so the shown
+      // command, if copy-pasted verbatim, is an inert no-op rather than a
+      // real invocation pointing at a non-existent file.
+      results.push({
+        member,
+        command: `# dry-run preview (temp file written only on real send): ${command}`,
+        message,
+        ok: true,
+      });
       continue;
     }
     try {
@@ -419,9 +443,12 @@ const app = new Elysia()
     }
     return { ok: true, mock: false, oracles };
   })
-  // Team fan-out. Body { members: string[], dryRun?: boolean }. When dryRun is
-  // true (or ?dryRun=true), constructs but does NOT send — returns the planned
-  // { member, command, message } list. Default (no flag) sends for real.
+  // Team fan-out. Body { members: string[], dryRun?: boolean }. FAIL-SAFE: the
+  // server DEFAULTS to dryRun=true — it constructs but does NOT send, returning
+  // the planned { member, command, message } list. A live fan-out requires an
+  // EXPLICIT opt-out: body `dryRun:false` (or `?dryRun=false` / `?dryRun=0`).
+  // A malformed/hand-rolled client that omits the flag gets a preview, never a
+  // real send — the safety default lives server-side, matching the UI toggle.
   .post(
     "/api/synapse/team",
     async ({ body, query }) => {
@@ -429,8 +456,10 @@ const app = new Elysia()
       if (members.length === 0) {
         return { ok: false, error: "no members", sent: [], dryRun: true };
       }
+      // Default TRUE. Only an explicit falsey signal (body dryRun:false, or
+      // query dryRun=false/0) unlocks a real send; anything else stays a preview.
       const dryRun =
-        body.dryRun ?? (query.dryRun === "true" || query.dryRun === "1");
+        body.dryRun ?? !(query.dryRun === "false" || query.dryRun === "0");
       const sent = await fanOutTeam(members, dryRun);
       return { ok: sent.every((s) => s.ok), sent, dryRun };
     },

@@ -10,16 +10,16 @@ React 19 + Tailwind v4 web app provides the board UI.
 (each an `OracleNode` tile with a status orb + host); drag from one node's
 handle to another (`@xyflow/react`) to draw an edge. Union-find over the drawn
 edges groups nodes into teams; **Form Team** fans an invite-tone message out to
-each member via `maw hey <member> -f <file>` (a dry-run toggle, default ON,
-previews without sending).
+each member via `maw hey <member> -f <file>` (a dry-run toggle, default ON —
+enforced server-side, previews without sending unless explicitly opted out).
 
 ## API
 
 | Route | Purpose |
 | ----- | ------- |
 | `GET /api/synapse/census` | Shells `maw census --json`, flattens oracles → nodes. Falls back to a small mock if census is empty/unavailable. |
-| `GET /api/synapse/stream?name=dev` | SSE log tail (#161). Tails `.synapse/<name>.log` (default `dev`) via one shared tailer per logfile (300ms poll, line-buffered fan-out), emitting each completed line as an event with a monotonic `id:`. A 256-line ring backs `Last-Event-ID` replay; 15s heartbeat comment; concurrent-client cap (24); the tailer is torn down when its last subscriber leaves. Live tail: `curl -N .../api/synapse/stream?name=dev`. Solves the maw stdio limit — the client reads the stream, not maw. |
-| `POST /api/synapse/team` | Body `{ members: string[], dryRun?: boolean }`. Writes an invite message to a temp file and delivers it to each member with `maw hey <member> -f <file>`. `dryRun` (body flag or `?dryRun=true`) returns the planned `{ member, command, message }` list without sending. Returns `{ ok, sent, dryRun }`. |
+| `GET /api/synapse/stream?name=dev` | SSE log tail (#161). Tails `.synapse/<name>.log` (default `dev`) via one shared tailer per logfile (300ms poll, line-buffered fan-out), emitting each completed line as an event with an `id:` anchored to the file's absolute line ordinal (stable across server restarts). A 256-line ring backs `Last-Event-ID` replay; 15s heartbeat comment; concurrent-client cap (24); the tailer is torn down when its last subscriber leaves. **Replay on connect:** a fresh connection with no `Last-Event-ID` replays the ring (recent history) as real events before live tailing — track `Last-Event-ID` to distinguish history from new appends. Live tail: `curl -N .../api/synapse/stream?name=dev`. Solves the maw stdio limit — the client reads the stream, not maw. |
+| `POST /api/synapse/team` | Body `{ members: string[], dryRun?: boolean }`. Writes an invite message to a temp file and delivers it to each member with `maw hey <member> -f <file>`. **Fail-safe: `dryRun` defaults to `true` server-side** — a preview (planned `{ member, command, message }` list) unless the caller explicitly opts out with body `dryRun:false` (or `?dryRun=false` / `?dryRun=0`). Returns `{ ok, sent, dryRun }`. |
 
 Two scars are designed around: `maw hey` rejects a body starting with `[` (it
 auto-signs a federation tag), and it mangles backtick / `$` / double-quote in an
