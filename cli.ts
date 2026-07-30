@@ -51,15 +51,18 @@ function usage(): InvokeResult {
   return {
     ok: false,
     output: [
-      "usage: maw synapse <serve|dev|build|status|stop>",
-      "  serve   build web, then run the production server DETACHED (Elysia serves web/dist)",
-      "  dev     run server + Vite dev DETACHED (hot reload)",
-      "  build   build the web SPA into web/dist (blocking, streams)",
-      "  status  fetch the running server's /status (real liveness)",
-      "  stop    stop a detached serve/dev started by this CLI",
+      "usage: maw synapse <serve|dev|build|status|stop|logs>",
+      "  serve         build web, then run the production server DETACHED (Elysia serves web/dist)",
+      "  dev           run server + Vite dev DETACHED (hot reload)",
+      "  build         build the web SPA into web/dist (blocking, streams)",
+      "  status        fetch the running server's /status (real liveness)",
+      "  stop          stop a detached serve/dev started by this CLI",
+      "  logs [name]   print the tail of .synapse/<name>.log (default dev) + the live-tail curl command",
+      "                flags: -n <N> lines (default 40), --once (snapshot then exit — the default)",
       "",
       "note: maw <cmd> cannot stream a long-running server (maw-rs: piped stdio + blocking .output).",
-      "      serve/dev detach and log to .synapse/<name>.log. For LIVE logs run `bun run dev` directly,",
+      "      serve/dev detach and log to .synapse/<name>.log. `logs` prints a run-once snapshot; for a",
+      "      LIVE tail the CLIENT must read the stream — run the printed `curl -N .../api/synapse/stream`,",
       "      or mount via engine.serve and start `maw serve` (→ http://<host>:3456/api/synapse/).",
     ].join("\n"),
   };
@@ -135,6 +138,43 @@ export async function runSynapse(args: string[]): Promise<InvokeResult> {
       } catch {
         return { ok: false, error: `synapse not reachable on :${port} — start it with 'maw synapse serve'` };
       }
+    }
+
+    if (sub === "logs") {
+      // Run-once-and-exit so it works THROUGH maw (which buffers + blocks).
+      // Prints a snapshot of the logfile tail plus the curl command that does a
+      // genuine live tail — honest about the maw stdio limit: the client, not
+      // maw, must do the streaming read.
+      const rest = args.slice(1);
+      const name = rest.find((a) => !a.startsWith("-")) ?? "dev";
+      let n = 40;
+      const ni = rest.indexOf("-n");
+      if (ni >= 0 && rest[ni + 1]) {
+        const parsed = Number(rest[ni + 1]);
+        if (Number.isFinite(parsed) && parsed > 0) n = Math.floor(parsed);
+      }
+      const logPath = join(RUN_DIR, `${name}.log`);
+      const streamUrl = `http://localhost:${port}/api/synapse/stream?name=${name}`;
+      if (!existsSync(logPath)) {
+        return {
+          ok: false,
+          error: `no logfile at ${logPath} — start it with 'maw synapse ${name === "serve" ? "serve" : "dev"}'`,
+        };
+      }
+      const lines = readFileSync(logPath, "utf8").split("\n");
+      if (lines.length && lines[lines.length - 1] === "") lines.pop();
+      const tail = lines.slice(-n);
+      return {
+        ok: true,
+        output: [
+          `synapse logs: ${name}.log (last ${tail.length} of ${lines.length} lines)`,
+          "─".repeat(48),
+          ...tail,
+          "─".repeat(48),
+          "live tail (SSE — the client reads the stream, not maw):",
+          `  curl -N ${streamUrl}`,
+        ].join("\n"),
+      };
     }
 
     if (sub === "stop") {

@@ -18,6 +18,7 @@ previews without sending).
 | Route | Purpose |
 | ----- | ------- |
 | `GET /api/synapse/census` | Shells `maw census --json`, flattens oracles → nodes. Falls back to a small mock if census is empty/unavailable. |
+| `GET /api/synapse/stream?name=dev` | SSE log tail (#161). Tails `.synapse/<name>.log` (default `dev`) via one shared tailer per logfile (300ms poll, line-buffered fan-out), emitting each completed line as an event with a monotonic `id:`. A 256-line ring backs `Last-Event-ID` replay; 15s heartbeat comment; concurrent-client cap (24); the tailer is torn down when its last subscriber leaves. Live tail: `curl -N .../api/synapse/stream?name=dev`. Solves the maw stdio limit — the client reads the stream, not maw. |
 | `POST /api/synapse/team` | Body `{ members: string[], dryRun?: boolean }`. Writes an invite message to a temp file and delivers it to each member with `maw hey <member> -f <file>`. `dryRun` (body flag or `?dryRun=true`) returns the planned `{ member, command, message }` list without sending. Returns `{ ok, sent, dryRun }`. |
 
 Two scars are designed around: `maw hey` rejects a body starting with `[` (it

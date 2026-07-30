@@ -1,12 +1,167 @@
 import { Elysia, t } from "elysia";
 import { join, normalize } from "node:path";
 import { tmpdir } from "node:os";
+import { statSync } from "node:fs";
 
 const PORT = Number(process.env.PORT ?? 3001);
 
 // Directory holding the built web SPA (web/dist). Overridable via env.
 const WEB_DIST = process.env.WEB_DIST ?? join(import.meta.dir, "..", "web", "dist");
 const INDEX_HTML = join(WEB_DIST, "index.html");
+
+// Directory holding detached-run logfiles (.synapse/<name>.log), written by the
+// CLI's spawnDetached. server/ is one level down, so `.synapse` is a sibling of
+// the repo root — resolve from import.meta.dir up one level.
+const SYNAPSE_DIR = process.env.SYNAPSE_DIR ?? join(import.meta.dir, "..", ".synapse");
+
+// --- SSE log streaming (#161) -------------------------------------------
+// The maw <cmd> stdio problem: `maw synapse dev|serve` DETACH the server and
+// write its output to .synapse/<name>.log — maw itself can never stream a
+// long-running child (it pipes stdio + blocks on .output()). So instead of
+// fighting stdout, we tail the logfile over SSE and let the CLIENT do the
+// reading (`curl -N` or a browser EventSource).
+//
+// Pattern reused from Stoa's /stream: one SharedTail per logfile (Map keyed by
+// absolute path) fanning completed lines out to all subscribers; a monotonic
+// event id + a small ring buffer for Last-Event-ID replay; a 15s heartbeat
+// comment; a concurrent-client cap; and teardown of the tailer once its last
+// subscriber leaves.
+
+const RING_CAP = 256; // lines retained for Last-Event-ID replay
+const POLL_MS = 300; // logfile poll interval
+const HEARTBEAT_MS = 15_000; // SSE keep-alive comment interval
+const MAX_SSE_CLIENTS = 24; // global concurrent-client cap
+
+type Subscriber = { send: (id: number, line: string) => void };
+type RingEntry = { id: number; line: string };
+
+// A per-logfile tailer. Polls the file for appended bytes, buffers partial
+// lines, and broadcasts each completed line (with a monotonic id) to every
+// subscriber. Seeds its ring from the file's existing tail so a fresh client
+// gets recent context immediately.
+class LogTailer {
+  private offset = 0; // byte offset consumed so far
+  private buf = ""; // partial (unterminated) trailing line
+  private nextId = 1;
+  private ring: RingEntry[] = [];
+  private subs = new Set<Subscriber>();
+  private timer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(
+    private readonly path: string,
+    private readonly onEmpty: () => void,
+  ) {}
+
+  private record(line: string): number {
+    const id = this.nextId++;
+    this.ring.push({ id, line });
+    if (this.ring.length > RING_CAP) this.ring.shift();
+    return id;
+  }
+
+  // Prime offset + ring from the file that already exists on disk.
+  async seed(): Promise<void> {
+    let size = 0;
+    try {
+      size = statSync(this.path).size;
+    } catch {
+      this.offset = 0;
+      return;
+    }
+    if (size === 0) {
+      this.offset = 0;
+      return;
+    }
+    const text = await Bun.file(this.path).text();
+    this.offset = size;
+    const parts = text.split("\n");
+    this.buf = parts.pop() ?? ""; // trailing partial line (no newline yet)
+    for (const raw of parts.slice(-RING_CAP)) {
+      this.record(stripCr(raw));
+    }
+  }
+
+  ensureRunning(): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => {
+      void this.poll();
+    }, POLL_MS);
+  }
+
+  private async poll(): Promise<void> {
+    let size: number;
+    try {
+      size = statSync(this.path).size;
+    } catch {
+      return; // file not present yet (or gone) — try again next tick
+    }
+    if (size < this.offset) {
+      // truncated / rotated — restart from the top
+      this.offset = 0;
+      this.buf = "";
+    }
+    if (size <= this.offset) return;
+    const text = await Bun.file(this.path).slice(this.offset, size).text();
+    this.offset = size;
+    this.buf += text;
+    let idx: number;
+    while ((idx = this.buf.indexOf("\n")) >= 0) {
+      const line = stripCr(this.buf.slice(0, idx));
+      this.buf = this.buf.slice(idx + 1);
+      const id = this.record(line);
+      for (const s of this.subs) s.send(id, line);
+    }
+  }
+
+  // Register a subscriber, replaying any buffered lines newer than lastEventId
+  // (undefined / NaN → replay the whole ring for immediate context).
+  addSub(sub: Subscriber, lastEventId?: number): void {
+    const from = Number.isFinite(lastEventId) ? (lastEventId as number) : 0;
+    for (const e of this.ring) {
+      if (e.id > from) sub.send(e.id, e.line);
+    }
+    this.subs.add(sub);
+  }
+
+  removeSub(sub: Subscriber): void {
+    this.subs.delete(sub);
+    if (this.subs.size === 0) this.stop();
+  }
+
+  private stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    this.onEmpty();
+  }
+}
+
+function stripCr(s: string): string {
+  return s.endsWith("\r") ? s.slice(0, -1) : s;
+}
+
+const tailers = new Map<string, LogTailer>();
+
+async function getTailer(path: string): Promise<LogTailer> {
+  let t = tailers.get(path);
+  if (!t) {
+    t = new LogTailer(path, () => tailers.delete(path));
+    await t.seed();
+    t.ensureRunning();
+    tailers.set(path, t);
+  }
+  return t;
+}
+
+// Only [A-Za-z0-9._-] names map to a logfile — blocks path traversal and any
+// separator. Returns null for anything else.
+function sanitizeLogName(name: string | undefined): string | null {
+  const n = (name ?? "dev").trim();
+  return /^[A-Za-z0-9._-]+$/.test(n) ? n : null;
+}
+
+let sseClientCount = 0;
 
 // --- Census (nodes = oracles) -------------------------------------------
 // Shape returned by `maw census --json`:
@@ -176,6 +331,85 @@ const app = new Elysia()
     prefix: process.env.MAW_ENGINE_SERVE_PREFIX ?? null,
     ts: Date.now(),
   }))
+  // SSE log stream (#161). Tails .synapse/<name>.log (default dev) and pushes
+  // each completed line as an SSE event (`id:` = monotonic line id). Supports
+  // Last-Event-ID replay from a 256-line ring, a 15s heartbeat comment, and a
+  // concurrent-client cap. Live tail: `curl -N .../stream?name=dev`.
+  .get(
+    "/api/synapse/stream",
+    async ({ query, request, set }) => {
+      const name = sanitizeLogName(query.name);
+      if (!name) {
+        set.status = 400;
+        return { ok: false, error: "invalid name (expected [A-Za-z0-9._-])" };
+      }
+      if (sseClientCount >= MAX_SSE_CLIENTS) {
+        set.status = 503;
+        return { ok: false, error: `too many clients (max ${MAX_SSE_CLIENTS})` };
+      }
+
+      const logPath = join(SYNAPSE_DIR, `${name}.log`);
+      const lastHeader = request.headers.get("last-event-id");
+      const lastEventId = lastHeader ? Number.parseInt(lastHeader, 10) : NaN;
+
+      const encoder = new TextEncoder();
+      let heartbeat: ReturnType<typeof setInterval> | null = null;
+      let sub: Subscriber | null = null;
+      let tailer: LogTailer | null = null;
+      let closed = false;
+
+      const cleanup = () => {
+        if (closed) return;
+        closed = true;
+        if (heartbeat) clearInterval(heartbeat);
+        if (tailer && sub) tailer.removeSub(sub);
+        sseClientCount--;
+      };
+
+      sseClientCount++;
+      request.signal.addEventListener("abort", cleanup);
+
+      const stream = new ReadableStream({
+        async start(controller) {
+          const enqueue = (chunk: string) => {
+            if (closed) return;
+            try {
+              controller.enqueue(encoder.encode(chunk));
+            } catch {
+              // controller already closed by the runtime — drop.
+            }
+          };
+
+          enqueue(`: connected to ${name}.log\n\n`);
+
+          sub = {
+            send: (id, line) => enqueue(`id: ${id}\ndata: ${line}\n\n`),
+          };
+          tailer = await getTailer(logPath);
+          tailer.addSub(sub, lastEventId);
+
+          heartbeat = setInterval(() => enqueue(`: ping ${Date.now()}\n\n`), HEARTBEAT_MS);
+        },
+        cancel() {
+          cleanup();
+        },
+      });
+
+      return new Response(stream, {
+        headers: {
+          "content-type": "text/event-stream; charset=utf-8",
+          "cache-control": "no-cache, no-transform",
+          connection: "keep-alive",
+          "x-accel-buffering": "no",
+        },
+      });
+    },
+    {
+      query: t.Object({
+        name: t.Optional(t.String()),
+      }),
+    },
+  )
   // Nodes for the graph board. Shells out to `maw census --json`; on any
   // failure or empty result, returns a small mock so the UI still renders.
   .get("/api/synapse/census", async () => {
