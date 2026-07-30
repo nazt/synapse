@@ -25,15 +25,35 @@ const defaultEdgeOptions = {
   style: { stroke: "#64b5f6", strokeWidth: 2 },
 } as const;
 
-// Lay oracles out on a circle so every node has clear handle room.
+// Calm status-grouped grid: dense, scannable, short edges. Active oracles land
+// first (top-left), so the live fleet reads at a glance. Columns scale gently
+// with fleet size and cap at 5 so rows stay readable, not a mile wide.
+const COL_STEP = 248;
+const ROW_STEP = 132;
+function gridColumns(count: number): number {
+  return Math.min(5, Math.max(3, Math.ceil(Math.sqrt(count))));
+}
 function layout(count: number, i: number): { x: number; y: number } {
-  if (count <= 1) return { x: 0, y: 0 };
-  const radius = Math.max(220, count * 46);
-  const angle = (i / count) * Math.PI * 2 - Math.PI / 2;
+  const cols = gridColumns(count);
+  const rows = Math.ceil(count / cols);
+  const col = i % cols;
+  const row = Math.floor(i / cols);
+  // Center the grid on the origin so fitView frames it evenly.
   return {
-    x: Math.round(Math.cos(angle) * radius),
-    y: Math.round(Math.sin(angle) * radius),
+    x: (col - (cols - 1) / 2) * COL_STEP,
+    y: (row - (rows - 1) / 2) * ROW_STEP,
   };
+}
+
+// Show the useful oracles first: active → idle → everything else. Stable
+// tiebreak by name so the grid doesn't reshuffle between census refreshes.
+const STATUS_RANK: Record<string, number> = { active: 0, idle: 1 };
+function byStatus(
+  a: { status: string; name: string },
+  b: { status: string; name: string },
+): number {
+  const d = (STATUS_RANK[a.status] ?? 2) - (STATUS_RANK[b.status] ?? 2);
+  return d !== 0 ? d : a.name.localeCompare(b.name);
 }
 
 export default function App() {
@@ -55,11 +75,12 @@ export default function App() {
       .then((res) => {
         if (cancelled) return;
         setMock(res.mock);
+        const sorted = [...res.oracles].sort(byStatus);
         setNodes(
-          res.oracles.map((o, i) => ({
+          sorted.map((o, i) => ({
             id: o.name,
             type: "oracle" as const,
-            position: layout(res.oracles.length, i),
+            position: layout(sorted.length, i),
             data: { ...o, highlighted: false, armed: false },
           })),
         );
@@ -146,6 +167,31 @@ export default function App() {
     [nodes, highlightSet, armedId],
   );
 
+  // Edges glow when they connect the currently-targeted team; the rest recede.
+  const displayEdges = useMemo(
+    () =>
+      edges.map((e) => {
+        const inTeam = highlightSet.has(e.source) && highlightSet.has(e.target);
+        return {
+          ...e,
+          animated: inTeam,
+          style: inTeam
+            ? {
+                stroke: "#64b5f6",
+                strokeWidth: 2.5,
+                filter: "drop-shadow(0 0 5px rgba(100,181,246,0.65))",
+              }
+            : { stroke: "#3b3b49", strokeWidth: 1.5 },
+        };
+      }),
+    [edges, highlightSet],
+  );
+
+  const liveCount = useMemo(
+    () => nodes.filter((n) => n.data.status === "active" || n.data.status === "idle").length,
+    [nodes],
+  );
+
   const canSubmit = edges.length >= 1 && target.length >= 2 && !busy;
 
   const submit = useCallback(async () => {
@@ -187,23 +233,28 @@ export default function App() {
   return (
     <div className="relative h-screen w-screen" style={{ background: "#0a0a0f" }}>
       {/* Header */}
-      <header className="pointer-events-none absolute left-0 top-0 z-10 flex items-center gap-3 p-4">
-        <h1
-          className="text-lg font-semibold tracking-tight"
-          style={{ color: "#64b5f6" }}
-        >
-          Synapse
-        </h1>
-        <span className="text-xs text-neutral-500">
+      <header className="pointer-events-none absolute left-0 top-0 z-10 flex items-center gap-3 px-5 py-4">
+        <div className="flex items-baseline gap-2.5">
+          <h1
+            className="text-[17px] font-semibold tracking-tight"
+            style={{ color: "#64b5f6" }}
+          >
+            Synapse
+          </h1>
+          <span className="text-[11px] tabular-nums text-neutral-600">
+            {liveCount}/{nodes.length} live
+          </span>
+        </div>
+        <span className="hidden text-xs text-neutral-500 sm:inline">
           click an oracle, then another, to link them into a team
         </span>
         {mock && (
-          <span className="rounded bg-amber-500/15 px-2 py-0.5 text-xs text-amber-400">
+          <span className="rounded-md bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-400">
             mock census
           </span>
         )}
         {loadError && (
-          <span className="rounded bg-red-500/15 px-2 py-0.5 text-xs text-red-400">
+          <span className="rounded-md bg-red-500/10 px-2 py-0.5 text-[11px] font-medium text-red-400">
             census error
           </span>
         )}
@@ -211,7 +262,7 @@ export default function App() {
 
       <ReactFlow
         nodes={displayNodes}
-        edges={edges}
+        edges={displayEdges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
@@ -222,10 +273,13 @@ export default function App() {
         nodeTypes={nodeTypes}
         defaultEdgeOptions={defaultEdgeOptions}
         fitView
+        fitViewOptions={{ padding: 0.28, maxZoom: 1.1 }}
+        minZoom={0.4}
+        maxZoom={1.6}
         proOptions={{ hideAttribution: true }}
         colorMode="dark"
       >
-        <Background color="#1c1c26" gap={22} />
+        <Background color="#191922" gap={26} size={1.5} />
         <Controls showInteractive={false} />
         <MiniMap
           pannable
